@@ -13,7 +13,7 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("package", type=Path,
-                        nargs="?", default=Path("dist/dart_data_recorder_v0.4.2.zip"))
+                        nargs="?", default=Path("dist/dart_data_recorder_v0.4.3.zip"))
     parser.add_argument("--skill", type=Path,
                         default=Path("/home/blade_master/pnx/maixpy-skill/maixpy"))
     args = parser.parse_args()

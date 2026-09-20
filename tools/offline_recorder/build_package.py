@@ -12,7 +12,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 APP_ID = "dart_data_recorder"
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 
 def sha256(data: bytes) -> str:

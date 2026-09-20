@@ -1,7 +1,7 @@
 id: dart_data_recorder
 name: Dart Data Recorder
 name[zh]: 飞镖数据录制
-version: 0.4.2
+version: 0.4.3
 author: RoboMaster Team
 desc: Tunable OS04A10 full-view 180fps data recorder
 desc[zh]: 可触摸调参的OS04A10全视野180帧离线录制程序

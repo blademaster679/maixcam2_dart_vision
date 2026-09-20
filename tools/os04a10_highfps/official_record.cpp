@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
         if (!nv21 && AX_VIN_SetPipeDumpAttr(0, AX_VIN_PIPE_DUMP_NODE_IFE, AX_VIN_DUMP_QUEUE_TYPE_DEV, &dump)) return 4;
         save_proc("_before.txt");
         save_registers(cam.ptSnsHdl[0], "registers_before.csv");
-        DirectVenc encoder(expected_w,expected_h,OS04A10_HFR_FPS,venc_retry,venc_fps,venc_depth,static_cast<size_t>(seconds + 1) * 400,200000);
+        DirectVenc encoder(expected_w,expected_h,OS04A10_HFR_FPS,venc_retry,venc_fps,venc_depth,static_cast<size_t>(seconds + 1) * 400,200000,30000);
         std::unique_ptr<VinVencQueue> sender;
         if(venc_worker)sender=std::make_unique<VinVencQueue>(encoder,venc_copy);
         const int original_policy=sched_getscheduler(0);

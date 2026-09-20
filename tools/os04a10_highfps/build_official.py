@@ -73,7 +73,7 @@ def main():
   link.insert(1,'-Wl,--as-needed');i=link.index('-o');link[i+1]=str(out/name);link[i:i]=[str(out/o) for o in objects]
   with (out/(name+'-link.log')).open('w') as log: subprocess.run(link,cwd=build,check=True,stdout=log,stderr=subprocess.STDOUT)
  app_sources={}
- for name in ['official_capture.cpp','official_camera_test.cpp','official_record.cpp','capture_health.hpp','direct_venc.hpp','frame_continuity.hpp','vin_venc_queue.hpp','venc_input_copy.hpp','vin_camera_settings.hpp']:
+ for name in ['official_capture.cpp','official_camera_test.cpp','official_record.cpp','capture_health.hpp','direct_venc.hpp','durable_checkpoint.hpp','frame_continuity.hpp','vin_venc_queue.hpp','venc_input_copy.hpp','vin_camera_settings.hpp']:
   if (HERE/name).exists():
    shutil.copy2(HERE/name,out/name);app_sources[name]=sha(HERE/name)
  if any(sha(Path(p))!=digest for p,digest in input_hashes.items()):

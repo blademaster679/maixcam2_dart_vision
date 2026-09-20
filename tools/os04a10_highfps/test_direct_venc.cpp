@@ -86,6 +86,13 @@ int main() {
  assert(pool_destroys==1);
  mode=3;attempts=0;
  {DirectVenc encoder(640,360,360,true,180,8);assert(config.stVencAttr.u8InFifoDepth==8 && config.stVencAttr.u8OutFifoDepth==8);assert(encoder.send(frame)==0);encoder.finish();assert(encoder.packets==1 && !encoder.failed);}
+ mode=3;attempts=0;
+ {DirectVenc encoder(640,360,180,true,0,8,12000,200000,1);
+  assert(encoder.send(frame)==0);std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  assert(encoder.send(frame)==0);encoder.finish();assert(!encoder.failed);
+  std::ifstream checkpoint("durable_checkpoint.json");std::string text((std::istreambuf_iterator<char>(checkpoint)),{});
+  assert(text.find("\"frames\":2")!=std::string::npos);
+ }
  mode=4;attempts=0;
  {DirectVenc encoder(1344,760,180,false,0,8,601*400);
   for(unsigned i=0;i<108100;++i) {frame.stVFrame.u64SeqNum=i;assert(encoder.send(frame)==0);}

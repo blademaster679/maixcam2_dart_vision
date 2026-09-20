@@ -9,12 +9,14 @@
 #include <vector>
 #include <iostream>
 #include "ax_venc_api.h"
+#include "durable_checkpoint.hpp"
 class DirectVenc {
     bool initialized=false,created=false,receiving=false,finished=false;
     std::atomic<bool> done{false};
     std::thread drain;
     bool retry_full=false;
     unsigned retry_budget_us=20000;
+    unsigned checkpoint_interval_ms=0;
     struct SendLog { unsigned long long seq,start,elapsed; unsigned retries; int result,status_result; unsigned left_pics,left_streams; };
     std::vector<SendLog> send_log;
     static unsigned long long clock_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -25,7 +27,7 @@ public:
     std::atomic<bool> failed{false};
     std::atomic<unsigned long> submitted{0},packets{0},send_errors{0},release_errors{0};
     unsigned long queue_full_events=0;
-    DirectVenc(unsigned w,unsigned h,unsigned fps,bool retry=false,unsigned rc_fps=0,unsigned fifo_depth=4,size_t log_capacity=12000,unsigned retry_budget=20000):retry_full(retry),retry_budget_us(retry_budget) {
+    DirectVenc(unsigned w,unsigned h,unsigned fps,bool retry=false,unsigned rc_fps=0,unsigned fifo_depth=4,size_t log_capacity=12000,unsigned retry_budget=20000,unsigned sync_interval_ms=0):retry_full(retry),retry_budget_us(retry_budget),checkpoint_interval_ms(sync_interval_ms) {
         try {
             send_log.reserve(log_capacity);
             AX_VENC_MOD_ATTR_T mod={};mod.enVencType=AX_VENC_VIDEO_ENCODER;
@@ -60,6 +62,16 @@ public:
                     std::ofstream stream("record.h264",std::ios::binary);
                     std::ofstream index("encoded_frames.csv");index<<"index,sequence,pts_raw,monotonic_us,bytes\n";
                     if(!stream||!index){failed=true;return;}
+                    DurableCheckpoint durable;
+                    const auto checkpoint_start=clock_us();
+                    auto last_checkpoint=checkpoint_start;
+                    auto snapshot=[&] {
+                        stream.flush();index.flush();
+                        if(!stream||!index)throw std::runtime_error("checkpoint stream flush failed");
+                        auto vb=stream.tellp(),ib=index.tellp();
+                        if(vb<0||ib<0)throw std::runtime_error("checkpoint offset failed");
+                        return DurableCheckpoint::Snapshot{static_cast<unsigned long long>(vb),static_cast<unsigned long long>(ib),packets.load(),(clock_us()-checkpoint_start)/1000};
+                    };
                     unsigned drain_timeouts=0;
                     while(!done || packets<submitted) {
                         AX_VENC_STREAM_T packet={};int rc=AX_VENC_GetStream(0,&packet,retry_full ? 0 : 200);
@@ -76,9 +88,13 @@ public:
                         ++packets;
                         if(AX_VENC_ReleaseStream(0,&packet)) {++release_errors;failed=true;break;}
                         if(!stream||!index) {failed=true;break;}
+                        if(checkpoint_interval_ms && durable.ready() && clock_us()-last_checkpoint>=checkpoint_interval_ms*1000ULL) {
+                            durable.request(snapshot());last_checkpoint=clock_us();
+                        }
                     }
                     stream.flush();index.flush();if(!stream||!index)failed=true;
-                }catch(...){failed=true;}
+                    if(checkpoint_interval_ms) {durable.wait();DurableCheckpoint::sync(snapshot());}
+                }catch(const std::exception &e){std::cerr<<"VENC drain/checkpoint: "<<e.what()<<'\n';failed=true;}catch(...){failed=true;}
             });
         }catch(...){finish();throw;}
     }
