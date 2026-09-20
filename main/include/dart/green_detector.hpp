@@ -175,6 +175,9 @@ struct GreenLightCandidateDebug {
     bool model_validated = false;
     bool saturated_core = false;
     bool selected = false;
+    float appearance_score = 0.0F;
+    float radial_support = 0.0F;
+    float axis_ratio = 0.0F;
 };
 
 struct LabThreshold {
@@ -276,6 +279,16 @@ struct DetectorConfig {
     int multiscale_full_refresh_interval = 1;
     float min_normalized_green_response = 0.045F;
     float min_normalized_inner_brightness = 0.06F;
+    // Optional bright green pixel evidence for normalized candidates; 0 disables.
+    int normalized_min_peak_green = 0;
+    // Independent per-frame evidence for the fast normalized path. Temporal
+    // association must never bypass these appearance checks.
+    bool enable_lamp_appearance = true;
+    float lamp_min_green_margin = 0.08F;
+    float lamp_min_color_fraction = 0.12F;
+    float lamp_min_relative_contrast = 0.12F;
+    float lamp_max_axis_ratio = 2.5F;
+    float lamp_min_core_fill = 0.80F;
     float min_normalized_contrast_z = -0.50F;
     float min_tracking_normalized_contrast_z = -2.0F;
     float normalized_brightness_weight = 0.20F;
@@ -300,15 +313,22 @@ struct ArmorConfig {
     float max_bar_length_px = 180.0F;
     float min_elongation = 1.45F;
     float max_pair_angle_deg = 20.0F;
+    // Offset of the two centers along their mean bar axis / mean bar length.
+    float max_pair_longitudinal_to_length = 0.6F;
     float min_length_ratio = 0.50F;
     float max_color_response_diff = 0.35F;
     float min_separation_to_length = 0.8F;
     float max_separation_to_length = 6.0F;
+    // Optional scale-consistency gate; zero preserves uncalibrated setups.
+    float max_separation_to_green_size = 0.0F;
     float min_green_offset_to_length = 0.55F;
     float max_green_offset_to_length = 5.0F;
     float max_green_lateral_to_separation = 0.75F;
     float min_geometry_confidence = 0.55F;
     int required_pose_hits = 3;
+    // Consecutive consistent fresh pair observations, not cached outputs.
+    int confirmation_hits = 3;
+    int confirmation_max_gap_ms = 100;
     int aim_blend_ms = 100;
     int cache_max_age_ms = 50;
 };
@@ -554,6 +574,10 @@ private:
     uint64_t armor_blend_start_us_ = 0;
     uint64_t last_armor_timestamp_us_ = 0;
     ArmorDetection last_armor_detection_{};
+    ArmorDetection armor_candidate_detection_{};
+    Point2f armor_candidate_green_center_{};
+    uint64_t armor_candidate_timestamp_us_ = 0;
+    int armor_candidate_hits_ = 0;
     std::size_t search_model_cursor_ = 0;
     uint64_t frame_counter_ = 0;
     uint64_t classical_detection_count_ = 0;

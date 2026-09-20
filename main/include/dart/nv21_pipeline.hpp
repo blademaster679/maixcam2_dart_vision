@@ -25,9 +25,11 @@ std::unique_ptr<maix::image::Image> nv21_rgb_region(const Nv21View &view,
 void invalidate_uncalibrated(TargetEstimate &target);
 TargetEstimate predict_full180_output(const TargetEstimate &source,
     detail::TemporalTracker tracker, const ApplicationConfig &config, uint64_t now);
+enum class PipelineInputSource { Vin, CachedVideo };
 class HighFpsPipeline {
 public:
-    explicit HighFpsPipeline(const ApplicationConfig &config, bool idle=false, bool stress=false);
+    explicit HighFpsPipeline(const ApplicationConfig &config, bool idle=false, bool stress=false,
+                             PipelineInputSource source=PipelineInputSource::Vin);
     ~HighFpsPipeline();
     void submit(std::shared_ptr<Nv21Frame> frame);
     void finish();
@@ -40,6 +42,7 @@ private:
     };
     ApplicationConfig config_;
     bool idle_, stress_;
+    PipelineInputSource input_source_;
     LatestFrameSlot<Nv21Frame> frames_;
     LatestFrameSlot<Snapshot> estimates_;
     std::atomic<bool> stopped_{false}, failed_{false};

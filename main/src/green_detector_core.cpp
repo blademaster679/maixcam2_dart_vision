@@ -622,6 +622,13 @@ GreenLightDetection TemporalTracker::update(const CandidateObservation *candidat
                 ? timestamp_us - last_measurement_timestamp_us_
                 : std::numeric_limits<uint64_t>::max();
         if (count_as_miss) {
+            // Acquisition must be supported by uninterrupted real evidence.
+            // Otherwise a glyph intermittently passing appearance checks can
+            // pool isolated hits across rejected frames and become a target.
+            // Keep its position for reacquisition, but restart confirmation.
+            // Scheduled skips and an already confirmed track retain their
+            // existing prediction/occlusion behaviour.
+            if (!was_tracking) hit_history_.clear();
             push_hit(false);
             ++missed_frames_;
             if (missed_frames_ >= config_.max_missed_frames) {

@@ -16,6 +16,34 @@ import tarfile
 import uuid
 
 
+def development_enter_command(launcher, headless=False, pause_camera=False):
+    """Select launcher isolation without initializing a display in headless mode.
+
+    This avoids an unnecessary display transaction; it cannot clear a stuck
+    kernel I2C transfer or make an unavailable camera usable.
+    """
+    if not headless:
+        return launcher.enter_command()
+    permitted_camera = ' && $i != "/maixapp/apps/camera/camera"' if pause_camera else ''
+    unrelated_apps = (
+        "ps -eo args | awk '{for (i=1; i<=NF; ++i) if "
+        "($i ~ /^\\/maixapp\\/apps\\// "
+        "&& $i !~ /^\\/maixapp\\/apps\\/launcher\\//"
+        + permitted_camera + ") {print; break}}'"
+    )
+    # Stop respawning first, then recheck after staging before the helper may
+    # terminate any apps, including interpreter-launched app scripts. Only the
+    # explicitly authorized camera may remain.
+    return (
+        f"{launcher.kill_launcher_daemon_command()}; "
+        f"unrelated_apps=$({unrelated_apps}); "
+        'if [ -n "$unrelated_apps" ]; then '
+        'printf \'Another app is active: %s\\n\' "$unrelated_apps" >&2; exit 1; fi; '
+        f"{launcher.ensure_maixapp_apps_stopped_command()}; "
+        "echo development_mode=entered_headless"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--skill', type=Path, default=Path('/home/blade_master/pnx/maixpy-skill/maixpy'))
@@ -51,6 +79,7 @@ def main():
     ap.add_argument('--crop-probe', action='store_true', help='Select the explicitly inferred crop candidate')
     ap.add_argument('--fullfov-probe', action='store_true', help='Select native full-array timing control (not 360fps)')
     ap.add_argument('--pause-camera-app', action='store_true', help='Temporarily pause the official camera app and ask the launcher to restore it')
+    ap.add_argument('--headless', action='store_true', help='Stop launcher/apps without initializing or refreshing a display; preserves launcher restoration')
     ap.add_argument('--nv21', action='store_true', help='Measure uncompressed VIN channel 0 NV21 instead of IFE RAW')
     ap.add_argument('--sample-frame', action='store_true', help='Save one diagnostic frame during warmup')
     ap.add_argument('--queue-depth', type=int, choices=range(4,33), help='Default: RAW 16, NV21 4')
@@ -195,7 +224,7 @@ def main():
     result_code = 1
     try:
         entered = True
-        ssh(launcher.enter_command(), 'mode-enter', timeout=30)
+        ssh(development_enter_command(launcher, args.headless, restore_camera), 'mode-enter', timeout=30)
         command = ['timeout', '--signal=TERM', '--kill-after=5', str(args.seconds+(90 if args.exercise_switch else 20)), './capture', '--seconds', str(args.seconds)]
         if args.gdb:
             at = command.index('./capture')
@@ -282,7 +311,7 @@ def main():
         'venc_copy':args.venc_copy,
         'itp_depth':args.itp_depth,
         'system_media_lib':args.system_media_lib, 'no_health':args.no_health, 'observe_gaps':args.observe_gaps,
-        'paused_official_camera':restore_camera,
+        'paused_official_camera':restore_camera, 'headless':args.headless,
         'profile':manifest.get('profile'), 'nv21':args.nv21, 'seconds':args.seconds,
         'exit_code':result_code, 'transport_exit_code':transport_code,
         'process_exit_code':process_code, 'queue_depth':args.queue_depth,

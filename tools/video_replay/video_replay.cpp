@@ -28,7 +28,9 @@ struct CommandLine {
     std::string jsonl_path;
     std::string config_path = "config/green_detector.conf";
     std::uint64_t max_frames = 0;
+    std::uint64_t frame_step = 1;
     bool native_resolution = false;
+    bool no_overlay_video = false;
 };
 
 CommandLine parse_command_line(int argc, char **argv)
@@ -38,7 +40,7 @@ CommandLine parse_command_line(int argc, char **argv)
         const std::string argument = argv[index];
         auto require_value = [&](const char *name) {
             if (++index >= argc) {
-                throw std::runtime_error(std::string(name) + " requires a path");
+                throw std::runtime_error(std::string(name) + " requires a value");
             }
             return std::string(argv[index]);
         };
@@ -51,29 +53,53 @@ CommandLine parse_command_line(int argc, char **argv)
             result.jsonl_path = require_value("--jsonl");
         } else if (argument == "--config") {
             result.config_path = require_value("--config");
-        } else if (argument == "--max-frames") {
-            const std::string value = require_value("--max-frames");
+        } else if (argument == "--max-frames" || argument == "--frame-step") {
+            const std::string value = require_value(argument.c_str());
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::runtime_error(argument + " requires an unsigned integer");
+            }
             std::size_t consumed = 0;
-            result.max_frames = std::stoull(value, &consumed);
+            const std::uint64_t number = std::stoull(value, &consumed);
             if (consumed != value.size()) {
-                throw std::runtime_error("--max-frames requires an integer");
+                throw std::runtime_error(argument + " requires an unsigned integer");
+            }
+            if (argument == "--frame-step") {
+                if (number == 0) {
+                    throw std::runtime_error("--frame-step must be positive");
+                }
+                result.frame_step = number;
+            } else {
+                result.max_frames = number;
             }
         } else if (argument == "--native-resolution") {
             result.native_resolution = true;
+        } else if (argument == "--no-overlay-video") {
+            result.no_overlay_video = true;
         } else if (argument == "--help" || argument == "-h") {
             std::cout
                 << "Usage: dart_video_replay --input INPUT.mp4 --output OUTPUT.mp4 "
                    "[--jsonl OUTPUT.jsonl] [--config green_detector.conf] "
-                   "[--max-frames N] [--native-resolution]\n";
+                   "[--max-frames N] [--native-resolution] [--frame-step N]\n"
+                << "       dart_video_replay --input INPUT.mp4 --no-overlay-video "
+                   "--jsonl OUTPUT.jsonl [options]\n"
+                << "--max-frames limits source frames; --frame-step processes source "
+                   "frames 0,N,2N,... with their original nominal timestamps.\n"
+                << "Replay uses decoded RGB, not the high-fps NV21 pipeline.\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + argument);
         }
     }
-    if (result.input_path.empty() || result.output_path.empty()) {
-        throw std::runtime_error("--input and --output are required");
+    if (result.input_path.empty()) {
+        throw std::runtime_error("--input is required");
+    }
+    if (!result.no_overlay_video && result.output_path.empty()) {
+        throw std::runtime_error("--output is required unless --no-overlay-video is set");
     }
     if (result.jsonl_path.empty()) {
+        if (result.output_path.empty()) {
+            throw std::runtime_error("--no-overlay-video requires --jsonl or --output");
+        }
         result.jsonl_path = result.output_path + ".jsonl";
     }
     return result;
@@ -284,6 +310,8 @@ void draw_overlay(cv::Mat &frame,
 
 void write_json_line(std::ostream &output,
                      std::uint64_t frame_index,
+                     std::uint64_t frame_step,
+                     bool diagnostic_only,
                      const dart::TargetEstimate &target,
                      const std::vector<dart::GreenLightCandidateDebug> &candidates,
                      double processing_ms,
@@ -293,6 +321,10 @@ void write_json_line(std::ostream &output,
     std::ostringstream extra;
     extra << std::fixed << std::setprecision(6)
           << ",\"frame\":" << frame_index
+          << ",\"frame_step\":" << frame_step
+          << ",\"replay_pipeline\":\"rgb\""
+          << ",\"replay_timestamps\":\"nominal_source_fps\""
+          << ",\"replay_diagnostic_only\":" << (diagnostic_only ? "true" : "false")
           << ",\"processing_ms\":" << processing_ms
           << ",\"detector_fps\":" << detector_fps
           << ",\"average_detector_fps\":" << average_detector_fps;
@@ -306,6 +338,11 @@ int run(int argc, char **argv)
     const CommandLine command_line = parse_command_line(argc, argv);
     dart::ApplicationConfig config =
         dart::load_application_config(command_line.config_path);
+    // This adapter cannot verify high-fps calibration or emulate the NV21
+    // source-ROI pipeline. Capture-cone bypass is also a diagnostic profile.
+    // Keep legacy calibrated RGB replay behavior only for its original profile.
+    const bool diagnostic_only = config.camera.fps > 60 ||
+                                 !config.detector.enable_capture_cone;
 
     cv::VideoCapture capture(command_line.input_path);
     if (!capture.isOpened()) {
@@ -361,15 +398,19 @@ int run(int argc, char **argv)
         config.detector.measurement_noise_position *= variance_scale;
     }
 
-    create_parent_directory(command_line.output_path);
     create_parent_directory(command_line.jsonl_path);
-    cv::VideoWriter writer(command_line.output_path,
-                           cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-                           source_fps,
-                           {width, height});
-    if (!writer.isOpened()) {
-        throw std::runtime_error("cannot create output video: " +
-                                 command_line.output_path);
+    const double output_fps = source_fps / command_line.frame_step;
+    cv::VideoWriter writer;
+    if (!command_line.no_overlay_video) {
+        create_parent_directory(command_line.output_path);
+        writer.open(command_line.output_path,
+                    cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                    output_fps,
+                    {width, height});
+        if (!writer.isOpened()) {
+            throw std::runtime_error("cannot create output video: " +
+                                     command_line.output_path);
+        }
     }
     std::ofstream jsonl(command_line.jsonl_path);
     if (!jsonl) {
@@ -384,6 +425,7 @@ int run(int argc, char **argv)
                                       nullptr);
     dart::VisualMotionEstimator visual_motion(config.visual_motion);
     std::uint64_t frame_index = 0;
+    std::uint64_t processed_frames = 0;
     std::uint64_t valid_frames = 0;
     std::uint64_t observed_frames = 0;
     std::uint64_t predicted_frames = 0;
@@ -397,10 +439,15 @@ int run(int argc, char **argv)
     dart::TrackState previous_state = dart::TrackState::Lost;
 
     cv::Mat source_bgr;
-    while (capture.read(source_bgr)) {
-        if (command_line.max_frames > 0 &&
-            frame_index >= command_line.max_frames) {
-            break;
+    while ((command_line.max_frames == 0 || frame_index < command_line.max_frames) &&
+           capture.grab()) {
+        if (frame_index % command_line.frame_step != 0) {
+            ++frame_index;
+            continue;
+        }
+        if (!capture.retrieve(source_bgr) || source_bgr.empty()) {
+            throw std::runtime_error("cannot decode source frame " +
+                                     std::to_string(frame_index));
         }
         cv::Mat bgr;
         if (source_bgr.cols == width && source_bgr.rows == height) {
@@ -425,12 +472,22 @@ int run(int argc, char **argv)
         }
         if (config.visual_motion.enabled &&
             visual_motion_allowed &&
-            frame_index % static_cast<std::uint64_t>(
+            processed_frames % static_cast<std::uint64_t>(
                 config.visual_motion.interval_frames) == 0) {
             motion_prior = visual_motion.update(frame, timestamp_us);
         }
-        const dart::TargetEstimate target = detector.process(
+        dart::TargetEstimate target = detector.process(
             frame, timestamp_us, motion_prior.valid ? &motion_prior : nullptr);
+        if (diagnostic_only) {
+            target.angles_valid = false;
+            target.safe_for_control = false;
+            target.pose.valid = false;
+            target.yaw_rad = target.pitch_rad = 0.0F;
+            target.green.yaw_rad = target.green.pitch_rad = 0.0F;
+            target.line_of_sight_camera = {0.0F, 0.0F, 0.0F};
+            target.line_of_sight_rate_rad_s = {0.0F, 0.0F};
+            target.angular_covariance = {0.0F, 0.0F};
+        }
         const auto &detection = target.green;
         const auto finished = std::chrono::steady_clock::now();
         const double processing_seconds =
@@ -439,12 +496,12 @@ int run(int argc, char **argv)
         const double detector_fps = processing_seconds > 0.0
                                         ? 1.0 / processing_seconds
                                         : 0.0;
-        detector_fps_ema = frame_index == 0
+        detector_fps_ema = processed_frames == 0
                                ? detector_fps
                                : 0.90 * detector_fps_ema + 0.10 * detector_fps;
         total_processing_seconds += processing_seconds;
         const double average_detector_fps = total_processing_seconds > 0.0
-                                                ? (frame_index + 1) /
+                                                ? (processed_frames + 1) /
                                                       total_processing_seconds
                                                 : 0.0;
 
@@ -476,30 +533,35 @@ int run(int argc, char **argv)
         previous_state = detection.state;
 
         const auto &candidates = detector.last_candidates();
-        draw_overlay(bgr,
-                     target,
-                     candidates,
-                     frame_index,
-                     total_frames,
-                     detector_fps_ema,
-                     average_detector_fps,
-                     processing_ms);
-        writer.write(bgr);
+        if (!command_line.no_overlay_video) {
+            draw_overlay(bgr,
+                         target,
+                         candidates,
+                         frame_index,
+                         total_frames,
+                         detector_fps_ema,
+                         average_detector_fps,
+                         processing_ms);
+            writer.write(bgr);
+        }
         write_json_line(jsonl,
                         frame_index,
+                        command_line.frame_step,
+                        diagnostic_only,
                         target,
                         candidates,
                         processing_ms,
                         detector_fps_ema,
                         average_detector_fps);
+        ++processed_frames;
         ++frame_index;
     }
 
-    if (frame_index == 0) {
+    if (processed_frames == 0) {
         throw std::runtime_error("input video contains no decodable frames");
     }
     const double average_detector_fps = total_processing_seconds > 0.0
-                                            ? frame_index / total_processing_seconds
+                                            ? processed_frames / total_processing_seconds
                                             : 0.0;
     std::cout << std::fixed << std::setprecision(3)
               << "{\"input\":\"" << command_line.input_path
@@ -512,7 +574,14 @@ int run(int argc, char **argv)
               << ",\"native_resolution\":"
               << (command_line.native_resolution ? "true" : "false")
               << ",\"source_fps\":" << source_fps
-              << ",\"frames\":" << frame_index
+              << ",\"output_fps\":" << output_fps
+              << ",\"frame_step\":" << command_line.frame_step
+              << ",\"replay_pipeline\":\"rgb\""
+              << ",\"replay_timestamps\":\"nominal_source_fps\""
+              << ",\"replay_diagnostic_only\":" << (diagnostic_only ? "true" : "false")
+              << ",\"overlay_video\":" << (command_line.no_overlay_video ? "false" : "true")
+              << ",\"source_frames_read\":" << frame_index
+              << ",\"frames\":" << processed_frames
               << ",\"valid_frames\":" << valid_frames
               << ",\"observed_frames\":" << observed_frames
               << ",\"predicted_frames\":" << predicted_frames
@@ -522,13 +591,13 @@ int run(int argc, char **argv)
               << ",\"tracking_frames\":" << tracking_frames
               << ",\"lost_frames\":" << lost_frames
               << ",\"valid_rate\":"
-              << static_cast<double>(valid_frames) / frame_index
+              << static_cast<double>(valid_frames) / processed_frames
               << ",\"tracking_rate\":"
-              << static_cast<double>(tracking_frames) / frame_index
+              << static_cast<double>(tracking_frames) / processed_frames
               << ",\"safe_rate\":"
-              << static_cast<double>(safe_frames) / frame_index
+              << static_cast<double>(safe_frames) / processed_frames
               << ",\"armor_rate\":"
-              << static_cast<double>(armor_frames) / frame_index
+              << static_cast<double>(armor_frames) / processed_frames
               << ",\"average_detector_fps\":" << average_detector_fps
               << "}\n";
     return 0;

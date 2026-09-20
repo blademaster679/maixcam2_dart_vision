@@ -100,7 +100,7 @@ void test_confirmation_and_loss()
     check(!tracker.has_prediction(), "fifth miss clears the prediction");
 }
 
-void test_sparse_three_of_five_confirmation()
+void test_interrupted_acquisition_requires_new_consecutive_hits()
 {
     dart::DetectorConfig config;
     dart::detail::TemporalTracker tracker(config);
@@ -109,9 +109,14 @@ void test_sparse_three_of_five_confirmation()
     tracker.update(nullptr, 1010000, config.camera_model);
     tracker.update(&candidate, 1020000, config.camera_model);
     tracker.update(nullptr, 1030000, config.camera_model);
-    const auto result = tracker.update(&candidate, 1040000, config.camera_model);
-    check(result.state == dart::TrackState::Tracking,
-          "three non-consecutive hits in five frames confirm tracking");
+    auto result = tracker.update(&candidate, 1040000, config.camera_model);
+    check(result.state == dart::TrackState::Candidate && !result.valid,
+          "rejected observations prevent pooling isolated acquisition hits");
+    result = tracker.update(&candidate, 1050000, config.camera_model);
+    check(!result.valid, "the second new consecutive observation remains tentative");
+    result = tracker.update(&candidate, 1060000, config.camera_model);
+    check(result.valid && !result.predicted,
+          "three new consecutive real observations complete acquisition");
 }
 
 void test_prediction_timeout_and_recovery()
@@ -571,11 +576,74 @@ void test_immediate_full_cone_reacquire()
           "full-cone reacquisition confirms the relocated target");
 }
 
+void test_armor_pair_geometry_and_clutter_budget()
+{
+    dart::DetectorConfig detector_config;
+    detector_config.enable_normalized_multiscale = false;
+    detector_config.enable_capture_cone = false;
+    // Isolate bar geometry from green acquisition latency. The sequential
+    // green-three/armor-three confirmation is covered by armor_stability_tests.
+    detector_config.confirm_hits = 1;
+    dart::ArmorConfig armor_config;
+    armor_config.min_green_size_px = 1.0F;
+    const auto detect = [&](maix::image::Image &image) {
+        dart::GreenLightDetector detector(detector_config, armor_config);
+        detector.process_target(image, 1000000);
+        detector.process_target(image, 1016667);
+        return detector.process_target(image, 1033334);
+    };
+
+    auto stacked = green_blob_image(160, 140, 76, 106, 8, 8, 80, 110);
+    stacked.fill_rect(79, 30, 3, 15, 250, 8, 8);
+    stacked.fill_rect(79, 65, 3, 15, 250, 8, 8);
+    check(!detect(stacked).armor.valid,
+          "two collinear fragments of one red bar cannot form an armor pair");
+
+    auto white_pair = green_blob_image(160, 140, 76, 106, 8, 8, 80, 110);
+    white_pair.fill_rect(49, 30, 3, 40, 250, 250, 250);
+    white_pair.fill_rect(109, 30, 3, 40, 250, 250, 250);
+    check(!detect(white_pair).armor.valid,
+          "white structures above a green lamp do not count as red bars");
+    white_pair.fill_rect(49, 30, 3, 40, 8, 8, 250);
+    white_pair.fill_rect(109, 30, 3, 40, 8, 8, 250);
+    check(!detect(white_pair).armor.valid,
+          "blue structures cannot satisfy a configured red pair");
+
+    auto clutter = green_blob_image(640, 200, 316, 156, 8, 8, 320, 160);
+    clutter.fill_rect(309, 132, 3, 14, 200, 100, 100);
+    clutter.fill_rect(329, 132, 3, 14, 200, 100, 100);
+    for (int row = 0; row < 6; ++row) {
+        for (int column = 0; column < 5; ++column) {
+            clutter.fill_rect(5 + column * 12, 5 + row * 20,
+                              1, 8, 250, 8, 8);
+        }
+    }
+    const auto crowded = detect(clutter);
+    check(crowded.armor.valid && std::fabs(crowded.armor.center.x - 320) < 1,
+          "geometrically impossible clutter cannot consume the entire bar budget");
+    clutter.fill_rect(305, 128, 30, 20, 0, 0, 0);
+    check(!detect(clutter).armor.valid,
+          "distant red clutter alone cannot form a target around the green lamp");
+
+    auto too_wide = armor_target_image(false);
+    check(detect(too_wide).armor.valid,
+          "uncalibrated scale gate is disabled by default");
+    armor_config.max_separation_to_green_size = 6.0F;
+    check(!detect(too_wide).armor.valid,
+          "optional green-size gate rejects an implausibly wide background pair");
+    auto rotated_pair = armor_target_image(true);
+    check(detect(rotated_pair).armor.valid,
+          "green-size gate retains a smaller pair at arbitrary roll");
+}
+
 void test_rotated_armor_and_planar_pose()
 {
     dart::DetectorConfig detector_config;
     detector_config.enable_normalized_multiscale = false;
     detector_config.enable_capture_cone = false;
+    // Test rotation, ROI coordinates and PnP with an immediately known anchor;
+    // armor_stability_tests independently exercise the full confirmation delay.
+    detector_config.confirm_hits = 1;
     dart::ArmorConfig armor_config;
     armor_config.min_green_size_px = 1.0F;
     armor_config.required_pose_hits = 3;
@@ -856,6 +924,29 @@ void test_configuration()
     }
     std::filesystem::remove(invalid_path);
     check(threw, "unknown configuration keys are rejected");
+    {
+        std::ofstream configured(invalid_path);
+        std::ifstream source(project_config);
+        configured << source.rdbuf();
+        configured << "armor.max_pair_longitudinal_to_length=0.45\n";
+        configured << "armor.max_separation_to_green_size=6\n";
+    }
+    const auto alignment_config = dart::load_application_config(invalid_path.string());
+    check(std::fabs(alignment_config.armor.max_pair_longitudinal_to_length - 0.45F) < 1.0e-6F &&
+              alignment_config.armor.max_separation_to_green_size == 6.0F,
+          "armor center-alignment and optional green-size tolerances are configurable");
+    std::filesystem::remove(invalid_path);
+    {
+        std::ofstream invalid(invalid_path);
+        std::ifstream source(project_config);
+        invalid << source.rdbuf();
+        invalid << "armor.max_pair_longitudinal_to_length=-0.1\n";
+    }
+    bool rejected_alignment = false;
+    try { (void)dart::load_application_config(invalid_path.string()); }
+    catch (const std::runtime_error &) { rejected_alignment = true; }
+    std::filesystem::remove(invalid_path);
+    check(rejected_alignment, "negative armor alignment tolerance is rejected");
     for(const auto *bad:{"highfps.green_hz=0", "highfps.green_hz=181", "highfps.armor_hz=91", "highfps.search_hz=-1"}) {
         {std::ofstream invalid(invalid_path);invalid<<bad<<'\n';}
         bool rejected=false;
@@ -887,6 +978,9 @@ void test_nv21_and_source_roi()
         const int offset=((py-r.y)*r.width+px-r.x)*3;
         check(rgb[offset+1]>240 && rgb[offset]<10 && rgb[offset+2]<10,"NV21 VU and padded stride conversion");
         dart::DetectorConfig c; c.enable_capture_cone=false;
+        // The square YUV swatch isolates stride/conversion/source-coordinate
+        // behavior; resolved lamp shape is covered by lamp_appearance_tests.
+        c.enable_lamp_appearance=false;
         c.camera_model={static_cast<float>(w),static_cast<float>(w),w/2.0F,h/2.0F};
         c.confirm_hits=1; c.confirm_window=1;
         dart::GreenLightDetector detector(c);
@@ -969,7 +1063,7 @@ void test_pipeline_shutdown_and_map_failure()
     }
     check(released==1,"failed mapping frame released exactly once after joined cleanup");
     {
-        dart::HighFpsPipeline pipeline(c,false,true);
+        dart::HighFpsPipeline pipeline(c,false,true,dart::PipelineInputSource::CachedVideo);
         for(int n=0;n<5;++n) {
             auto f=std::make_shared<Frame>(released,false);
             const auto stamp=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -980,17 +1074,28 @@ void test_pipeline_shutdown_and_map_failure()
         }
         pipeline.finish();check(!pipeline.failed(),"async motion and control pipeline completes real synthetic image work");
         std::ifstream outputs("targets.jsonl");std::string line;
+        bool saw_replay_output=false;
         while(std::getline(outputs,line)) {
+            check(line.find("\"measurement_timestamp_source\":\"cached_video_submit_host_monotonic\"")!=std::string::npos,
+                  "cached video outputs must not claim VIN receive timestamps");
+            check(line.find("\"replay_diagnostic_only\":true")!=std::string::npos,
+                  "cached video outputs are marked diagnostic");
+            saw_replay_output=true;
             if(line.find("\"source_metadata_valid\":true")==std::string::npos) continue;
             const auto stamp=std::stoull(line.substr(line.find("\"timestamp_us\":")+15));
             const auto source=std::stoull(line.substr(line.find("\"source_received_us\":")+21));
             check(stamp>=source,"output timestamp follows acquired source snapshot");
         }
+        check(saw_replay_output,"cached replay emitted source-labeled output");
     }
     check(released==6,"all submitted frames released after vision and motion join");
     {
         dart::HighFpsPipeline empty(c); empty.finish();
         check(!empty.failed(),"empty pipeline wakes and joins cleanly");
+        std::ifstream summary("business.json"); std::string line;
+        std::getline(summary,line);
+        check(line.find("\"input_source\":\"vin\"")!=std::string::npos,
+              "existing live pipeline retains VIN source by default");
     }
 }
 
@@ -1016,12 +1121,89 @@ void test_integral_peak_equivalence()
     }
 }
 
+void test_normalized_peak_green_evidence()
+{
+    const auto candidates_for = [](dart::DetectorConfig config,
+                                    uint8_t red, uint8_t green, uint8_t blue,
+                                    bool add_white_pixel = false) {
+        maix::image::Image image(128, 128);
+        image.fill_rect(0, 0, 128, 128, 12, 12, 12);
+        image.fill_rect(58, 58, 11, 11, red, green, blue);
+        if (add_white_pixel) {
+            image.set_pixel(63, 63, 255, 255, 255);
+        }
+        dart::GreenLightDetector detector(config);
+        detector.process(image, 1000000);
+        return detector.last_candidates().size();
+    };
+    for (int mode = 0; mode < 4; ++mode) {
+        dart::DetectorConfig config;
+        config.enable_capture_cone = false;
+        config.enable_legacy_lab_candidates = false;
+        config.enable_saturated_core_candidates = false;
+        config.enable_sparse_component_search = mode >= 2;
+        config.integral_peak_statistics = mode == 3;
+        config.multiscale_downsample = mode == 1 ? 2 : 1;
+        // Isolate the older optional absolute-brightness gate. The default
+        // appearance gate intentionally rejects the yellow control below.
+        config.enable_lamp_appearance = false;
+        check(config.normalized_min_peak_green == 0,
+              "bright-green evidence remains opt-in for existing profiles");
+        check(candidates_for(config, 10, 202, 15) > 0 &&
+                  candidates_for(config, 250, 255, 15) > 0,
+              "disabled evidence gate preserves normalized dim-green and yellow hypotheses");
+        config.normalized_min_peak_green = 220;
+        check(candidates_for(config, 10, 255, 15) > 0,
+              "bright green lamp survives evidence gate in dense, sparse and integral paths");
+        check(candidates_for(config, 10, 202, 15) == 0,
+              "dim green paper lacks required bright green evidence");
+        check(candidates_for(config, 250, 255, 15) == 0,
+              "bright yellow lacks green-over-red evidence despite normalized response");
+        check(candidates_for(config, 10, 202, 15, true) == 0,
+              "separate white highlight cannot satisfy brightness and green dominance");
+        check(candidates_for(config, 10, 220, 15) > 0 &&
+                  candidates_for(config, 10, 219, 15) == 0,
+              "bright green evidence threshold is inclusive and enforced in RGB units");
+    }
+
+    dart::DetectorConfig legacy;
+    legacy.enable_normalized_multiscale = false;
+    legacy.normalized_min_peak_green = 255;
+    dart::GreenLightDetector legacy_detector(legacy);
+    auto image = green_blob_image(120, 90, 46, 36, 8, 8, 50.0F, 40.0F);
+    legacy_detector.process(image, 1000000);
+    legacy_detector.process(image, 1016667);
+    check(legacy_detector.process(image, 1033334).valid,
+          "normalized evidence threshold does not filter legacy LAB detections");
+
+    const auto path = std::filesystem::temp_directory_path() /
+                      "dart_normalized_peak_evidence_test.conf";
+    for (const int threshold : {-1, 0, 220, 255, 256}) {
+        {
+            std::ofstream file(path);
+            std::ifstream source(std::filesystem::path(TEST_PROJECT_ROOT) /
+                                 "config/green_detector.conf");
+            file << source.rdbuf();
+            file << "\nmultiscale.min_peak_green=" << threshold << '\n';
+        }
+        bool rejected = false;
+        try {
+            const auto parsed = dart::load_application_config(path.string());
+            check(parsed.detector.normalized_min_peak_green == threshold,
+                  "normalized green evidence threshold parses exactly");
+        } catch (const std::runtime_error &) { rejected = true; }
+        check(rejected == (threshold < 0 || threshold > 255),
+              "normalized green evidence threshold rejects values outside 0..255");
+    }
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main()
 {
     test_confirmation_and_loss();
-    test_sparse_three_of_five_confirmation();
+    test_interrupted_acquisition_requires_new_consecutive_hits();
     test_prediction_timeout_and_recovery();
     test_growing_size_tracker();
     test_confirmation_requires_same_candidate();
@@ -1035,6 +1217,7 @@ int main()
     test_normalized_multiscale_and_capture_cone();
     test_immediate_full_cone_reacquire();
     test_rotated_armor_and_planar_pose();
+    test_armor_pair_geometry_and_clutter_budget();
     test_npu_gate_and_control_prediction_budget();
     test_visual_motion_json_and_future_imu_interpolation();
     test_configuration();
@@ -1042,6 +1225,7 @@ int main()
     test_full180_fused_prediction();
     test_pipeline_shutdown_and_map_failure();
     test_integral_peak_equivalence();
+    test_normalized_peak_green_evidence();
 
     if (failures != 0) {
         std::cerr << failures << " test assertion(s) failed\n";

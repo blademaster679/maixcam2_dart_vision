@@ -123,6 +123,14 @@ Image::Image(const cv::Mat &rgb888)
     rgb888_ = rgb888.isContinuous() ? rgb888 : rgb888.clone();
 }
 
+Image::Image(int width, int height, Format format)
+{
+    if (width <= 0 || height <= 0 || format != Format::FMT_RGB888) {
+        throw std::invalid_argument("OpenCV Image allocation requires positive RGB888 dimensions");
+    }
+    rgb888_.create(height, width, CV_8UC3);
+}
+
 Format Image::format() { return Format::FMT_RGB888; }
 int Image::width() { return rgb888_.cols; }
 int Image::height() { return rgb888_.rows; }

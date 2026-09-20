@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace dart {
@@ -230,6 +231,273 @@ struct ResponseComponent {
     std::size_t local_peak_count = 0;
 };
 
+bool has_bright_green_evidence(const uint8_t *rgb,
+                               int image_width,
+                               const Rect &inner,
+                               const DetectorConfig &config)
+{
+    if (config.normalized_min_peak_green == 0) {
+        return true;
+    }
+    const float minimum_dominance = 255.0F * config.min_green_dominance;
+    for (int y = inner.y0; y < inner.y1; ++y) {
+        for (int x = inner.x0; x < inner.x1; ++x) {
+            const std::size_t offset =
+                (static_cast<std::size_t>(y) * image_width + x) * 3U;
+            const int green = rgb[offset + 1];
+            if (green >= config.normalized_min_peak_green &&
+                green - std::max(rgb[offset], rgb[offset + 2]) >= minimum_dominance) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct LampAppearance {
+    bool valid = false;
+    float color_fraction = 0.0F;
+    float relative_contrast = 0.0F;
+    float radial_support = 0.0F;
+    float axis_ratio = 0.0F;
+    float shape = 0.0F;
+    float score = 0.0F;
+    float center_x = 0.0F, center_y = 0.0F;
+    int x = 0, y = 0, width = 0, height = 0;
+};
+
+// Appearance is measured anew on every frame, including confirmed tracks.
+// A green maximum alone also describes edges, tape and broad colored surfaces.
+// Require a compact, locally brighter patch supported by genuinely green
+// pixels. White cores are allowed: color support may come from their halo.
+LampAppearance lamp_appearance(const uint8_t *rgb, int width, int height,
+                               int cx, int cy, int diameter,
+                               const DetectorConfig &config)
+{
+    LampAppearance result;
+    const int radius = std::max(1, diameter / 2);
+    const int outer = std::min(std::max(radius + 3, diameter),
+        std::min({cx, cy, width - 1 - cx, height - 1 - cy}));
+    if (outer > 128) return result; // bound component-validation work
+    // Incomplete surroundings cannot establish a closed lamp appearance.
+    if (outer < radius + 3) return result;
+    std::array<double, 8> sector_sum{};
+    std::array<int, 8> sector_count{};
+    double luminance_sum = 0, mass = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    double boundary_margin = 0;
+    int count = 0, colored = 0, boundary_count = 0, peak_margin = 0, peak_luma = 0, peak_green = 0;
+    for (int dy = -outer; dy <= outer; ++dy) {
+        for (int dx = -outer; dx <= outer; ++dx) {
+            const auto *p = rgb + (static_cast<std::size_t>(cy + dy) * width + cx + dx) * 3;
+            const int luminance = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+            const int margin = static_cast<int>(p[1]) - std::max(p[0], p[2]);
+            if (std::abs(dx) == outer || std::abs(dy) == outer) {
+                boundary_margin += std::max(0, margin);
+                ++boundary_count;
+            }
+            if (std::abs(dx) <= radius && std::abs(dy) <= radius) {
+                ++count;
+                luminance_sum += luminance;
+                peak_luma = std::max(peak_luma, luminance);
+                peak_green = std::max(peak_green, static_cast<int>(p[1]));
+                if (margin >= std::max(4.0F, config.lamp_min_green_margin * p[1])) {
+                    ++colored;
+                    peak_margin = std::max(peak_margin, margin);
+                }
+            } else {
+                int sector;
+                if (std::abs(dx) > 2 * std::abs(dy)) sector = dx > 0 ? 0 : 4;
+                else if (std::abs(dy) > 2 * std::abs(dx)) sector = dy > 0 ? 2 : 6;
+                else if (dx > 0) sector = dy > 0 ? 1 : 7;
+                else sector = dy > 0 ? 3 : 5;
+                sector_sum[sector] += luminance;
+                ++sector_count[sector];
+            }
+        }
+    }
+    result.color_fraction = static_cast<float>(colored) / count;
+    if (colored < 2 || result.color_fraction < config.lamp_min_color_fraction)
+        return result;
+    // A white reflection on a broad green surface has a bright core but no
+    // localized green support. Require its chromatic halo to stand out too.
+    if (peak_margin - boundary_margin / std::max(1, boundary_count) <
+        std::max(4.0F, config.lamp_min_relative_contrast * peak_margin)) return result;
+    const float inside = static_cast<float>(luminance_sum / count);
+    float background = 0;
+    int directions = 0;
+    for (std::size_t i = 0; i < sector_sum.size(); ++i) {
+        if (!sector_count[i]) return result;
+        const float surrounding = static_cast<float>(sector_sum[i] / sector_count[i]);
+        background += surrounding / 8;
+        if (inside - surrounding >= std::max(4.0F, config.lamp_min_relative_contrast * inside))
+            ++directions;
+    }
+    result.radial_support = directions / 8.0F;
+    result.relative_contrast = (inside - background) / std::max(inside, 1.0F);
+    // Two contaminated sectors tolerate adjacent structure without admitting
+    // a half-plane edge. Covariance separately rejects narrow colored lines.
+    if (directions < 6 || result.relative_contrast < config.lamp_min_relative_contrast)
+        return result;
+    // Follow connected support beyond the scoring window. A line endpoint
+    // and one lobe of a larger halo must not masquerade as separate lamps.
+    const int side = 2 * outer + 1;
+    const float background_margin = static_cast<float>(boundary_margin / std::max(1, boundary_count));
+    const float support_margin = background_margin + 0.20F * (peak_margin - background_margin);
+    const float support_luma = background + std::max(2.0F, 0.15F * (peak_luma - background));
+    std::vector<uint8_t> support(static_cast<std::size_t>(side) * side, 0);
+    int seed = -1, seed_margin = -1;
+    for (int dy = -outer; dy <= outer; ++dy) for (int dx = -outer; dx <= outer; ++dx) {
+        const auto *p = rgb + (static_cast<std::size_t>(cy + dy) * width + cx + dx) * 3;
+        const int margin = static_cast<int>(p[1]) - std::max(p[0], p[2]);
+        const float luma = static_cast<float>((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8);
+        const bool color = margin >= std::max({4.0F, config.lamp_min_green_margin * p[1], support_margin}) &&
+            luma >= support_luma;
+        const bool core = std::min({p[0], p[1], p[2]}) >= 0.65F * std::max({p[0], p[1], p[2]}) &&
+            p[1] >= 0.85F * peak_green && p[1] + 4 >= std::max(p[0], p[2]) && luma > std::max(0.8F * inside,
+                background + std::max(4.0F, config.lamp_min_relative_contrast * inside));
+        const int index = (dy + outer) * side + dx + outer;
+        support[index] = color || core;
+        if (color && std::abs(dx) <= radius && std::abs(dy) <= radius && margin > seed_margin) {
+            seed = index; seed_margin = margin;
+        }
+    }
+    if (seed < 0) return result;
+    std::vector<int> component; component.reserve(support.size()); component.push_back(seed);
+    support[seed] = 0;
+    int min_x = side, min_y = side, max_x = 0, max_y = 0;
+    int component_colored = 0, component_strong_colored = 0;
+    int component_peak_green = 0, component_peak_luma = 0;
+    std::array<int, 256> component_luma_histogram{};
+    std::array<int, 2> strongest_color_green{};
+    double center_mass = 0, center_x = 0, center_y = 0;
+    for (std::size_t next = 0; next < component.size(); ++next) {
+        const int index = component[next], px = index % side, py = index / side;
+        if (px == 0 || py == 0 || px == side - 1 || py == side - 1) return result;
+        min_x = std::min(min_x, px); min_y = std::min(min_y, py);
+        max_x = std::max(max_x, px); max_y = std::max(max_y, py);
+        const int dx = px - outer, dy = py - outer;
+        mass += 1; sx += dx; sy += dy;
+        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+        const auto *p = rgb + (static_cast<std::size_t>(cy + dy) * width + cx + dx) * 3;
+        component_peak_green = std::max(component_peak_green, static_cast<int>(p[1]));
+        const int color_margin = static_cast<int>(p[1]) - std::max(p[0], p[2]);
+        const float color_luma = static_cast<float>((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8);
+        component_peak_luma = std::max(component_peak_luma, static_cast<int>(color_luma));
+        ++component_luma_histogram[static_cast<int>(color_luma)];
+        if (color_margin >= std::max({4.0F, config.lamp_min_green_margin * p[1], support_margin}) &&
+            color_luma >= support_luma) {
+            ++component_colored;
+            // Hysteresis: weak halo pixels reconstruct the shape, but a
+            // neutral highlight with only a slight green cast cannot establish
+            // color identity. Require resolved stronger chromatic support too.
+            if (color_margin >= std::max(8.0F, 2 * config.lamp_min_green_margin * p[1])) {
+                ++component_strong_colored;
+                if (p[1] > strongest_color_green[0]) {
+                    strongest_color_green[1] = strongest_color_green[0];
+                    strongest_color_green[0] = p[1];
+                } else strongest_color_green[1] = std::max(strongest_color_green[1], static_cast<int>(p[1]));
+            }
+        }
+        const double weight = std::max(1.0F,
+            static_cast<float>((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8) - background);
+        center_mass += weight; center_x += weight * dx; center_y += weight * dy;
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) {
+            const int neighbor = index + oy * side + ox;
+            if (support[neighbor]) { support[neighbor] = 0; component.push_back(neighbor); }
+        }
+    }
+    // Dark colored edges must not lend their hue to a bright neutral surface.
+    // Relate both supporting pixels to this COMPLETE component's signal peak,
+    // not the seed window: a small seed on the dark rim can omit its white core.
+    if (component_strong_colored < 2 || strongest_color_green[1] < 0.5F * component_peak_green ||
+        component_colored / mass < config.lamp_min_color_fraction)
+        return result;
+    // A blurred glyph can have a connected, almost elliptical halo while its
+    // luminous body consists of separated strokes. Check the FULL component's
+    // mid-brightness sections, including white cores, independently of hue.
+    // Use moderate levels for filled-area evidence. At the bright-core level,
+    // LED texture may split the disk, so only its axis ratio is constrained.
+    // Unresolved sections (<8 pixels) cannot establish either shape property.
+    struct CoreMoments {
+        double n = 0, x = 0, y = 0, xx = 0, yy = 0, xy = 0;
+    };
+    std::array<CoreMoments, 3> cores{};
+    const std::array<float, 3> levels{{0.40F, 0.50F, 0.80F}};
+    // An isolated glint must not raise the bright-core threshold until only
+    // an arbitrary stripe of an otherwise filled textured lamp remains.
+    // Use P95 for this high level only; retain the actual peak for mid-level
+    // structure and for the independent chromatic-identity checks above.
+    int robust_peak_luma = component_peak_luma, cumulative = 0;
+    const int peak_rank = static_cast<int>(std::ceil(0.95 * mass));
+    for (int luma = 0; luma < 256; ++luma) {
+        cumulative += component_luma_histogram[luma];
+        if (cumulative >= peak_rank) { robust_peak_luma = luma; break; }
+    }
+    for (const int index : component) {
+        const int dx = index % side - outer, dy = index / side - outer;
+        const auto *p = rgb + (static_cast<std::size_t>(cy + dy) * width + cx + dx) * 3;
+        const int luma = (77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8;
+        for (std::size_t level = 0; level < cores.size(); ++level) {
+            const int peak = level == 2 ? robust_peak_luma : component_peak_luma;
+            if (luma < background + levels[level] * (peak - background)) continue;
+            auto &core = cores[level];
+            ++core.n; core.x += dx; core.y += dy;
+            core.xx += dx * dx; core.yy += dy * dy; core.xy += dx * dy;
+        }
+    }
+    for (std::size_t level = 0; level < cores.size(); ++level) {
+        const auto &core = cores[level];
+        if (core.n < 8) continue;
+        const double ux = core.x / core.n, uy = core.y / core.n;
+        const double vx = std::max(0.0, core.xx / core.n - ux * ux) + 1.0 / 12;
+        const double vy = std::max(0.0, core.yy / core.n - uy * uy) + 1.0 / 12;
+        const double vxy = core.xy / core.n - ux * uy;
+        // A uniformly filled ellipse has area = 4*pi*sqrt(det(covariance)).
+        // Concave strokes, holes and separated lobes spread the second moments
+        // without filling that area. This needs no hull sort or extra flood.
+        const double fill = core.n / (4.0 * 3.14159265358979323846 *
+            std::sqrt(std::max(1.0e-12, vx * vy - vxy * vxy)));
+        const double delta = std::hypot(vx - vy, 2 * vxy);
+        const double axis = std::sqrt((vx + vy + delta) /
+            std::max(1.0e-6, vx + vy - delta));
+        if ((level < 2 && fill < config.lamp_min_core_fill) || axis > config.lamp_max_axis_ratio)
+            return result;
+    }
+    const double mx = sx / mass, my = sy / mass;
+    // Pixel-footprint variance makes the shape of small resolved patches
+    // well-defined without allowing a single color-noise pixel to qualify.
+    const double xx = std::max(0.0, sxx / mass - mx * mx) + 1.0 / 12;
+    const double yy = std::max(0.0, syy / mass - my * my) + 1.0 / 12;
+    const double xy = sxy / mass - mx * my;
+    const double delta = std::hypot(xx - yy, 2 * xy);
+    result.axis_ratio = static_cast<float>(std::sqrt((xx + yy + delta) /
+        std::max(1.0e-6, xx + yy - delta)));
+    if (result.axis_ratio > config.lamp_max_axis_ratio) return result;
+    // A resolved filled ellipse has squared Mahalanobis radius <=4 under
+    // its own uniform-area covariance. Allow pixelization/segmentation error,
+    // but reject the extended corners of a large flat rectangular surface.
+    if (mass >= 64) {
+        const double determinant = xx * yy - xy * xy;
+        int outside_ellipse = 0;
+        for (const int index : component) {
+            const double dx = index % side - outer - mx, dy = index / side - outer - my;
+            if ((yy * dx * dx - 2 * xy * dx * dy + xx * dy * dy) /
+                determinant > 4.5) ++outside_ellipse;
+        }
+        if (outside_ellipse > 0.03 * mass) return result;
+    }
+    result.shape = 1.0F / result.axis_ratio;
+    result.center_x = cx + static_cast<float>(center_x / center_mass);
+    result.center_y = cy + static_cast<float>(center_y / center_mass);
+    result.x = cx + min_x - outer; result.y = cy + min_y - outer;
+    result.width = max_x - min_x + 1; result.height = max_y - min_y + 1;
+    result.score = 0.35F * clamp01(result.color_fraction / 0.5F) +
+                   0.35F * clamp01(result.relative_contrast / 0.6F) +
+                   0.30F * result.shape;
+    result.valid = true;
+    return result;
+}
+
 ScalePeak evaluate_component_scale(const uint8_t *rgb,
                                    int image_width,
                                    int image_height,
@@ -342,6 +610,11 @@ ScalePeak evaluate_component_scale(const uint8_t *rgb,
     if (contrast_z < minimum_contrast_z) {
         return rejected;
     }
+    // Evaluate native RGB evidence only after the existing cheap gates. This
+    // also applies when response/contrast statistics came from integral planes.
+    if (!has_bright_green_evidence(rgb, image_width, inner, config)) {
+        return rejected;
+    }
 
     return ScalePeak{center_x, center_y, diameter, response, inner_green,
                      inner_brightness, brightness_contrast, contrast_z};
@@ -361,6 +634,15 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
     if (search_width <= 0 || search_height <= 0) {
         return peaks;
     }
+    std::vector<int> diameters(config.multiscale_diameters_px.begin(), config.multiscale_diameters_px.end());
+    if (config.enable_lamp_appearance) {
+        // Complete-component validation must also cover close-range lamps,
+        // not merely fragments at the old small peak scales. Extend by octaves
+        // while leaving room for surrounding evidence in the current ROI.
+        const int limit = std::min(128, 3 * std::min(search_width, search_height) / 4);
+        for (int64_t next = static_cast<int64_t>(diameters.back()) * 2; next <= limit; next *= 2)
+            diameters.push_back(static_cast<int>(next));
+    }
 
     {
         // Divide the capture cone into tiny tiles and retain the strongest
@@ -379,6 +661,9 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             uint8_t response = 0;
             int x = 0;
             int y = 0;
+            uint8_t brightness = 0;
+            int bright_x = 0;
+            int bright_y = 0;
         };
 
         const uint8_t response_threshold = static_cast<uint8_t>(std::max(
@@ -393,17 +678,24 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             (search_height + kTileSize - 1) / kTileSize;
         std::vector<TileSeed> tile_seeds(
             static_cast<std::size_t>(tile_columns) * tile_rows);
-        IntegralPlane<uint32_t> response_integral(search_width, search_height);
-        IntegralPlane<uint32_t> brightness_integral(config.integral_peak_statistics ? search_width : 0,
-                                                   config.integral_peak_statistics ? search_height : 0);
-        IntegralPlane<uint64_t> squared_integral(config.integral_peak_statistics ? search_width : 0,
-                                                config.integral_peak_statistics ? search_height : 0);
-        for (int local_y = 0; local_y < search_height; ++local_y) {
+        // Coarse hypotheses keep the original search-region clipping. Exact
+        // refinement may later need surrounding pixels; grow its cache only
+        // after the retained hypotheses establish the necessary support.
+        Rect statistics_region = search_region;
+        const int statistics_width = statistics_region.x1 - statistics_region.x0;
+        const int statistics_height = statistics_region.y1 - statistics_region.y0;
+        IntegralPlane<uint32_t> response_integral(statistics_width, statistics_height);
+        // Coarse ranking must use the same brightness contribution as exact
+        // refinement; otherwise a pale bright core is pruned by green alone.
+        IntegralPlane<uint32_t> brightness_integral(statistics_width, statistics_height);
+        IntegralPlane<uint64_t> squared_integral(config.integral_peak_statistics ? statistics_width : 0,
+                                                config.integral_peak_statistics ? statistics_height : 0);
+        for (int local_y = 0; local_y < statistics_height; ++local_y) {
             uint32_t response_row_sum = 0, brightness_row_sum = 0;
             uint64_t squared_row_sum = 0;
-            const int image_y = search_region.y0 + local_y;
-            for (int local_x = 0; local_x < search_width; ++local_x) {
-                const int image_x = search_region.x0 + local_x;
+            const int image_y = statistics_region.y0 + local_y;
+            for (int local_x = 0; local_x < statistics_width; ++local_x) {
+                const int image_x = statistics_region.x0 + local_x;
                 const std::size_t image_offset =
                     (static_cast<std::size_t>(image_y) * image_width +
                      image_x) * 3U;
@@ -418,20 +710,22 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
                     response_row_sum;
                 const uint8_t brightness = static_cast<uint8_t>(
                     (77U * red + 150U * green + 29U * blue) >> 8U);
+                brightness_row_sum+=brightness;
+                brightness_integral.at(local_x+1,local_y+1)=brightness_integral.at(local_x+1,local_y)+brightness_row_sum;
                 if (config.integral_peak_statistics) {
-                    brightness_row_sum+=brightness;
                     squared_row_sum+=static_cast<uint64_t>(brightness)*brightness;
-                    brightness_integral.at(local_x+1,local_y+1)=brightness_integral.at(local_x+1,local_y)+brightness_row_sum;
                     squared_integral.at(local_x+1,local_y+1)=squared_integral.at(local_x+1,local_y)+squared_row_sum;
                 }
-                if (response < response_threshold) continue;
-                if (brightness < brightness_threshold) {
-                    continue;
-                }
+                if (image_x < search_region.x0 || image_x >= search_region.x1 ||
+                    image_y < search_region.y0 || image_y >= search_region.y1) continue;
                 TileSeed &seed = tile_seeds[
-                    static_cast<std::size_t>(local_y / kTileSize) *
+                    static_cast<std::size_t>((image_y - search_region.y0) / kTileSize) *
                         tile_columns +
-                    local_x / kTileSize];
+                    (image_x - search_region.x0) / kTileSize];
+                if (green >= red && green >= blue && brightness > seed.brightness) {
+                    seed.brightness = brightness; seed.bright_x = image_x; seed.bright_y = image_y;
+                }
+                if (response < response_threshold || brightness < brightness_threshold) continue;
                 if (response > seed.response) {
                     seed.response = response;
                     seed.x = image_x;
@@ -465,8 +759,19 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             if (inner_area <= 0 || ring_area <= 0) {
                 return result;
             }
-            const uint64_t inner_sum = response_integral.sum(inner);
-            const uint64_t outer_sum = response_integral.sum(outer);
+            // Preserve the coarse search-window clipping and ranking exactly;
+            // only the integral-plane origin changes when padding is cached.
+            const auto statistics_rect = [&](Rect rect) {
+                const int dx = search_region.x0 - statistics_region.x0;
+                const int dy = search_region.y0 - statistics_region.y0;
+                rect.x0 += dx; rect.x1 += dx;
+                rect.y0 += dy; rect.y1 += dy;
+                return rect;
+            };
+            const Rect cached_inner = statistics_rect(inner);
+            const Rect cached_outer = statistics_rect(outer);
+            const uint64_t inner_sum = response_integral.sum(cached_inner);
+            const uint64_t outer_sum = response_integral.sum(cached_outer);
             const float inner_green = static_cast<float>(inner_sum) /
                 (255.0F * inner_area);
             if (inner_green <
@@ -476,11 +781,15 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             const float ring_green =
                 static_cast<float>(outer_sum - inner_sum) /
                 (255.0F * ring_area);
+            const auto inner_luma_sum = brightness_integral.sum(cached_inner);
+            const float inner_luma = static_cast<float>(inner_luma_sum) / (255.0F * inner_area);
+            const float ring_luma = static_cast<float>(brightness_integral.sum(cached_outer) - inner_luma_sum) /
+                (255.0F * ring_area);
             result.x = image_center_x;
             result.y = image_center_y;
             result.diameter = diameter;
             result.response = inner_green - ring_green +
-                0.05F * inner_green;
+                config.normalized_brightness_weight * std::max(-0.10F, inner_luma - ring_luma);
             result.green_mean = inner_green;
             return result;
         };
@@ -491,11 +800,19 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             if (seed.response == 0U) {
                 continue;
             }
+            // Keep a bright seed as well as a chromatic seed in tiles that
+            // contain green evidence. This preserves white-core/green-halo
+            // lamps without giving every neutral highlight a search budget.
+            for (int seed_kind = 0; seed_kind < 2; ++seed_kind) {
+            if (seed_kind == 1 && (seed.brightness == 0 ||
+                (seed.bright_x == seed.x && seed.bright_y == seed.y))) continue;
+            const int seed_x = seed_kind ? seed.bright_x : seed.x;
+            const int seed_y = seed_kind ? seed.bright_y : seed.y;
             ScalePeak best;
             ScalePeak second_best;
-            for (const int diameter : config.multiscale_diameters_px) {
+            for (const int diameter : diameters) {
                 const ScalePeak candidate =
-                    rank_peak(seed.x, seed.y, diameter);
+                    rank_peak(seed_x, seed_y, diameter);
                 if (candidate.diameter == 0) {
                     continue;
                 }
@@ -513,6 +830,7 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
             }
             if (second_best.diameter > 0) {
                 coarse_peaks.push_back(second_best);
+            }
             }
         }
         const auto stronger_peak =
@@ -549,11 +867,73 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
                 }
             }
         }
+        // Neighbour refinement can visit the same location and scale from
+        // several seeds. Their integral statistics and rank are identical;
+        // spending several slots on them can remove the full-lamp hypothesis
+        // while retaining many copies of small kernels on its colored rim.
+        // Preserve the first occurrence and its order before applying the
+        // existing fixed budget; no additional exact evaluations are allowed.
+        struct PeakLocationHash {
+            std::size_t operator()(const std::array<int, 3> &location) const
+            {
+                std::size_t hash = 0;
+                for (const int value : location)
+                    hash ^= std::hash<int>{}(value) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+                return hash;
+            }
+        };
+        std::unordered_set<std::array<int, 3>, PeakLocationHash> seen_locations;
+        seen_locations.reserve(refined_peaks.size());
+        auto unique_end = refined_peaks.begin();
+        for (const auto &peak : refined_peaks) {
+            if (seen_locations.insert({peak.x, peak.y, peak.diameter}).second)
+                *unique_end++ = peak;
+        }
+        refined_peaks.erase(unique_end, refined_peaks.end());
         if (refined_peaks.size() > kExactHypotheses) {
             std::nth_element(refined_peaks.begin(),
                              refined_peaks.begin() + kExactHypotheses,
                              refined_peaks.end(), stronger_peak);
             refined_peaks.resize(kExactHypotheses);
+        }
+        if (config.integral_peak_statistics) {
+            Rect required = statistics_region;
+            for (const auto &ranked : refined_peaks) {
+                const int radius = std::max(1, ranked.diameter / 2);
+                const int outer = std::max(radius + 2, ranked.diameter);
+                const Rect support = clip_rect(ranked.x - outer, ranked.y - outer,
+                    2 * outer + 1, 2 * outer + 1, image_width, image_height);
+                required.x0 = std::min(required.x0, support.x0);
+                required.y0 = std::min(required.y0, support.y0);
+                required.x1 = std::max(required.x1, support.x1);
+                required.y1 = std::max(required.y1, support.y1);
+            }
+            if (required.x0 != statistics_region.x0 || required.y0 != statistics_region.y0 ||
+                required.x1 != statistics_region.x1 || required.y1 != statistics_region.y1) {
+                // Only genuine cache misses pay for an expanded plane. Without
+                // this, large optional scales would enlarge every tracking
+                // cache even when all selected small peaks already fit.
+                statistics_region = required;
+                const int w = required.x1 - required.x0, h = required.y1 - required.y0;
+                response_integral = IntegralPlane<uint32_t>(w, h);
+                brightness_integral = IntegralPlane<uint32_t>(w, h);
+                squared_integral = IntegralPlane<uint64_t>(w, h);
+                for (int y = 0; y < h; ++y) {
+                    uint32_t response_row = 0, brightness_row = 0;
+                    uint64_t squared_row = 0;
+                    for (int x = 0; x < w; ++x) {
+                        const auto *p = rgb + (static_cast<std::size_t>(y + required.y0) *
+                            image_width + x + required.x0) * 3;
+                        const uint32_t brightness = (77U * p[0] + 150U * p[1] + 29U * p[2]) >> 8U;
+                        response_row += fast_normalized_green_response(p[0], p[1], p[2]);
+                        brightness_row += brightness;
+                        squared_row += static_cast<uint64_t>(brightness) * brightness;
+                        response_integral.at(x + 1, y + 1) = response_integral.at(x + 1, y) + response_row;
+                        brightness_integral.at(x + 1, y + 1) = brightness_integral.at(x + 1, y) + brightness_row;
+                        squared_integral.at(x + 1, y + 1) = squared_integral.at(x + 1, y) + squared_row;
+                    }
+                }
+            }
         }
         peaks.reserve(refined_peaks.size());
         for (const auto &ranked : refined_peaks) {
@@ -563,7 +943,7 @@ std::vector<ScalePeak> collect_sparse_multiscale_peaks(
                 config.integral_peak_statistics ? &response_integral : nullptr,
                 config.integral_peak_statistics ? &brightness_integral : nullptr,
                 config.integral_peak_statistics ? &squared_integral : nullptr,
-                config.integral_peak_statistics ? &search_region : nullptr);
+                config.integral_peak_statistics ? &statistics_region : nullptr);
             if (exact.diameter > 0) {
                 peaks.push_back(exact);
             }
@@ -979,6 +1359,10 @@ void GreenLightDetector::reset()
     armor_blend_start_us_ = 0;
     last_armor_timestamp_us_ = 0;
     last_armor_detection_ = ArmorDetection{};
+    armor_candidate_detection_ = ArmorDetection{};
+    armor_candidate_green_center_ = Point2f{};
+    armor_candidate_timestamp_us_ = 0;
+    armor_candidate_hits_ = 0;
     search_model_cursor_ = 0;
     frame_counter_ = 0;
     classical_detection_count_ = 0;
@@ -1264,9 +1648,9 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
         if (tracker_.tracking_confirmed() && tracker_.missed_frames() == 0 &&
             config_.multiscale_tracking_roi_radius_px > 0.0F &&
             !refresh_full_cone) {
-            const int radius = static_cast<int>(std::ceil(
-                std::max(config_.multiscale_tracking_roi_radius_px,
-                         config_.gate_max_px)));
+            const int radius = static_cast<int>(std::ceil(std::max({
+                config_.multiscale_tracking_roi_radius_px, config_.gate_max_px,
+                config_.enable_lamp_appearance ? 1.5F * tracker_.predicted_size() : 0.0F})));
             const Rect tracking_region = clip_rect(
                 static_cast<int>(std::floor(tracker_.predicted_x())) - radius,
                 static_cast<int>(std::floor(tracker_.predicted_y())) - radius,
@@ -1426,6 +1810,14 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
                         search_region.y1 - 1,
                         search_region.y0 + y * sampling_stride +
                             sampling_stride / 2);
+                    const int native_radius = std::max(1, configured_diameter / 2);
+                    const Rect native_inner = clip_rect(
+                        peak_x - native_radius, peak_y - native_radius,
+                        2 * native_radius + 1, 2 * native_radius + 1,
+                        image_width, image_height);
+                    if (!has_bright_green_evidence(rgb, image_width, native_inner, config_)) {
+                        continue;
+                    }
                     ScalePeak peak{peak_x, peak_y,
                                    configured_diameter, response, inner_green,
                                    inner_brightness, brightness_contrast,
@@ -1478,6 +1870,13 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
                 continue;
             }
 
+            LampAppearance appearance;
+            if (config_.enable_lamp_appearance) {
+                appearance = lamp_appearance(rgb, image_width, image_height,
+                    peak.x, peak.y, peak.diameter, config_);
+                if (!appearance.valid) continue;
+            }
+
             const int radius = std::max(1, peak.diameter / 2);
             const Rect inner = clip_rect(peak.x - radius, peak.y - radius,
                                          2 * radius + 1, 2 * radius + 1,
@@ -1485,6 +1884,7 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
             float weighted_x = 0.0F;
             float weighted_y = 0.0F;
             float weight_sum = 0.0F;
+            if (!config_.enable_lamp_appearance) {
             for (int y = inner.y0; y < inner.y1; ++y) {
                 for (int x = inner.x0; x < inner.x1; ++x) {
                     const std::size_t offset =
@@ -1499,29 +1899,33 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
                     weight_sum += response;
                 }
             }
-            const float center_x = weight_sum > 1.0e-5F
+            }
+            const float center_x = config_.enable_lamp_appearance ? appearance.center_x : weight_sum > 1.0e-5F
                                        ? weighted_x / weight_sum
                                        : static_cast<float>(peak.x);
-            const float center_y = weight_sum > 1.0e-5F
+            const float center_y = config_.enable_lamp_appearance ? appearance.center_y : weight_sum > 1.0e-5F
                                        ? weighted_y / weight_sum
                                        : static_cast<float>(peak.y);
             detail::CandidateObservation observation;
             observation.center_x = center_x;
             observation.center_y = center_y;
-            observation.bbox_x = inner.x0;
-            observation.bbox_y = inner.y0;
-            observation.bbox_w = inner.x1 - inner.x0;
-            observation.bbox_h = inner.y1 - inner.y0;
-            observation.apparent_size = static_cast<float>(peak.diameter);
+            observation.bbox_x = config_.enable_lamp_appearance ? appearance.x : inner.x0;
+            observation.bbox_y = config_.enable_lamp_appearance ? appearance.y : inner.y0;
+            observation.bbox_w = config_.enable_lamp_appearance ? appearance.width : inner.x1 - inner.x0;
+            observation.bbox_h = config_.enable_lamp_appearance ? appearance.height : inner.y1 - inner.y0;
+            observation.apparent_size = config_.enable_lamp_appearance
+                ? std::sqrt(static_cast<float>(appearance.width * appearance.height))
+                : static_cast<float>(peak.diameter);
             observation.source = detail::CandidateSource::NormalizedResponse;
             observation.association_score = tracker_.association_score(observation);
             const float response_score = clamp01(
                 (peak.response - config_.min_normalized_green_response) /
                 std::max(0.02F, 0.30F - config_.min_normalized_green_response));
-            observation.score = clamp01(
-                0.55F * response_score +
-                0.20F * clamp01(peak.green_mean / 0.45F) +
-                0.25F * observation.association_score);
+            observation.score = config_.enable_lamp_appearance
+                ? clamp01(0.30F * response_score + 0.55F * appearance.score +
+                          0.15F * observation.association_score)
+                : clamp01(0.55F * response_score + 0.20F * clamp01(peak.green_mean / 0.45F) +
+                          0.25F * observation.association_score);
 
             Candidate candidate;
             candidate.observation = observation;
@@ -1533,9 +1937,12 @@ GreenLightDetector::collect_candidates(maix::image::Image &frame)
             candidate.debug.bbox_h = observation.bbox_h;
             candidate.debug.apparent_size = observation.apparent_size;
             candidate.debug.green_dominance = peak.green_mean;
-            candidate.debug.green_fraction = 1.0F;
+            candidate.debug.green_fraction = config_.enable_lamp_appearance ? appearance.color_fraction : 1.0F;
             candidate.debug.local_contrast = peak.brightness_contrast;
-            candidate.debug.shape_score = 1.0F;
+            candidate.debug.shape_score = config_.enable_lamp_appearance ? appearance.shape : 1.0F;
+            candidate.debug.appearance_score = appearance.score;
+            candidate.debug.radial_support = appearance.radial_support;
+            candidate.debug.axis_ratio = appearance.axis_ratio;
             candidate.debug.temporal_score = observation.association_score;
             candidate.debug.score = observation.score;
             candidate.debug.normalized_response = peak.response;
@@ -1917,6 +2324,10 @@ GreenLightDetection GreenLightDetector::process_green(
         local_config.integral_peak_statistics = true;
         GreenLightDetector local(local_config, armor_config_, target_geometry_);
         local.tracker_ = tracker_.roi_view(region_.x, region_.y);
+        // The adapter is recreated per frame, but full-search cadence belongs
+        // to the persistent detector. Leaving this at zero forced a full ROI
+        // search on every frame and disabled the configured tracking window.
+        local.classical_detection_count_ = classical_detection_count_;
         candidates = local.collect_candidates(frame);
         for (auto &c : candidates) {
             c.observation.center_x += region_.x; c.observation.center_y += region_.y;

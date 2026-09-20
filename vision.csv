@@ -1,0 +1,1 @@
+sequence,pts_raw,received_us,started_us,finished_us,search_ran,green_ran,armor_ran,motion_ran,search_us,roi_convert_us,detect_us,motion_us,direct_green,green_us,roi_x,roi_y,roi_width,roi_height,proposal_count,green_state,green_valid,green_predicted,green_x,green_y,green_size,armor_valid,roi_mode,roi_tracker_reset

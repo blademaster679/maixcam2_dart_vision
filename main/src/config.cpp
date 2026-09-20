@@ -187,6 +187,18 @@ void validate(const ApplicationConfig &config)
         config.detector.min_normalized_green_response > 1.0F ||
         config.detector.min_normalized_inner_brightness < 0.0F ||
         config.detector.min_normalized_inner_brightness > 1.0F ||
+        config.detector.normalized_min_peak_green < 0 ||
+        config.detector.normalized_min_peak_green > 255 ||
+        config.detector.lamp_min_green_margin <= 0.0F ||
+        config.detector.lamp_min_green_margin >= 1.0F ||
+        config.detector.lamp_min_color_fraction <= 0.0F ||
+        config.detector.lamp_min_color_fraction > 1.0F ||
+        config.detector.lamp_min_relative_contrast <= 0.0F ||
+        config.detector.lamp_min_relative_contrast >= 1.0F ||
+        config.detector.lamp_max_axis_ratio < 1.0F ||
+        config.detector.lamp_max_axis_ratio > 10.0F ||
+        config.detector.lamp_min_core_fill <= 0.0F ||
+        config.detector.lamp_min_core_fill > 1.0F ||
         config.detector.min_normalized_contrast_z < -10.0F ||
         config.detector.min_normalized_contrast_z > 10.0F ||
         config.detector.min_tracking_normalized_contrast_z < -10.0F ||
@@ -257,12 +269,14 @@ void validate(const ApplicationConfig &config)
         config.armor.min_elongation < 1.0F ||
         config.armor.max_pair_angle_deg <= 0.0F ||
         config.armor.max_pair_angle_deg >= 90.0F ||
+        config.armor.max_pair_longitudinal_to_length < 0.0F ||
         config.armor.min_length_ratio <= 0.0F ||
         config.armor.min_length_ratio > 1.0F ||
         config.armor.max_color_response_diff <= 0.0F ||
         config.armor.min_separation_to_length <= 0.0F ||
         config.armor.max_separation_to_length <
             config.armor.min_separation_to_length ||
+        config.armor.max_separation_to_green_size < 0.0F ||
         config.armor.min_green_offset_to_length < 0.0F ||
         config.armor.max_green_offset_to_length <
             config.armor.min_green_offset_to_length ||
@@ -270,6 +284,8 @@ void validate(const ApplicationConfig &config)
         config.armor.min_geometry_confidence < 0.0F ||
         config.armor.min_geometry_confidence > 1.0F ||
         config.armor.required_pose_hits <= 0 || config.armor.aim_blend_ms < 0 ||
+        config.armor.confirmation_hits <= 0 || config.armor.confirmation_hits > 100 ||
+        config.armor.confirmation_max_gap_ms <= 0 || config.armor.confirmation_max_gap_ms > 1000 ||
         config.armor.cache_max_age_ms < 0) {
         throw std::runtime_error("armor geometry settings are invalid");
     }
@@ -433,6 +449,13 @@ ApplicationConfig load_application_config(const std::string &path)
         else if (key == "performance.multiscale_full_refresh_interval") config.detector.multiscale_full_refresh_interval = parse_int(key, value);
         else if (key == "multiscale.min_green_response") config.detector.min_normalized_green_response = parse_float(key, value);
         else if (key == "multiscale.min_inner_brightness") config.detector.min_normalized_inner_brightness = parse_float(key, value);
+        else if (key == "multiscale.min_peak_green") config.detector.normalized_min_peak_green = parse_int(key, value);
+        else if (key == "appearance.enabled") config.detector.enable_lamp_appearance = parse_bool(key, value);
+        else if (key == "appearance.min_green_margin") config.detector.lamp_min_green_margin = parse_float(key, value);
+        else if (key == "appearance.min_color_fraction") config.detector.lamp_min_color_fraction = parse_float(key, value);
+        else if (key == "appearance.min_relative_contrast") config.detector.lamp_min_relative_contrast = parse_float(key, value);
+        else if (key == "appearance.max_axis_ratio") config.detector.lamp_max_axis_ratio = parse_float(key, value);
+        else if (key == "appearance.min_core_fill") config.detector.lamp_min_core_fill = parse_float(key, value);
         else if (key == "multiscale.min_contrast_z") config.detector.min_normalized_contrast_z = parse_float(key, value);
         else if (key == "multiscale.min_tracking_contrast_z") config.detector.min_tracking_normalized_contrast_z = parse_float(key, value);
         else if (key == "multiscale.brightness_weight") config.detector.normalized_brightness_weight = parse_float(key, value);
@@ -451,15 +474,19 @@ ApplicationConfig load_application_config(const std::string &path)
         else if (key == "armor.max_bar_length_px") config.armor.max_bar_length_px = parse_float(key, value);
         else if (key == "armor.min_elongation") config.armor.min_elongation = parse_float(key, value);
         else if (key == "armor.max_pair_angle_deg") config.armor.max_pair_angle_deg = parse_float(key, value);
+        else if (key == "armor.max_pair_longitudinal_to_length") config.armor.max_pair_longitudinal_to_length = parse_float(key, value);
         else if (key == "armor.min_length_ratio") config.armor.min_length_ratio = parse_float(key, value);
         else if (key == "armor.max_color_response_diff") config.armor.max_color_response_diff = parse_float(key, value);
         else if (key == "armor.min_separation_to_length") config.armor.min_separation_to_length = parse_float(key, value);
         else if (key == "armor.max_separation_to_length") config.armor.max_separation_to_length = parse_float(key, value);
+        else if (key == "armor.max_separation_to_green_size") config.armor.max_separation_to_green_size = parse_float(key, value);
         else if (key == "armor.min_green_offset_to_length") config.armor.min_green_offset_to_length = parse_float(key, value);
         else if (key == "armor.max_green_offset_to_length") config.armor.max_green_offset_to_length = parse_float(key, value);
         else if (key == "armor.max_green_lateral_to_separation") config.armor.max_green_lateral_to_separation = parse_float(key, value);
         else if (key == "armor.min_geometry_confidence") config.armor.min_geometry_confidence = parse_float(key, value);
         else if (key == "armor.required_pose_hits") config.armor.required_pose_hits = parse_int(key, value);
+        else if (key == "armor.confirmation_hits") config.armor.confirmation_hits = parse_int(key, value);
+        else if (key == "armor.confirmation_max_gap_ms") config.armor.confirmation_max_gap_ms = parse_int(key, value);
         else if (key == "armor.aim_blend_ms") config.armor.aim_blend_ms = parse_int(key, value);
         else if (key == "armor.cache_max_age_ms") config.armor.cache_max_age_ms = parse_int(key, value);
         else if (key == "target_geometry.pose_enabled") config.target_geometry.pose_enabled = parse_bool(key, value);

@@ -55,6 +55,7 @@ float color_response(uint8_t red,
 
 std::vector<RawBar> collect_bars(maix::image::Image &frame,
                                  const ArmorConfig &config,
+                                 const GreenLightDetection &green,
                                  ArmorColor color)
 {
     const int width = frame.width();
@@ -80,7 +81,15 @@ std::vector<RawBar> collect_bars(maix::image::Image &frame,
             const float brightness =
                 (0.299F * red + 0.587F * green + 0.114F * blue) / 255.0F;
             const float response = color_response(red, green, blue, color);
-            if (brightness >= config.min_brightness &&
+            const int dominant = color == ArmorColor::Blue ? blue : red;
+            const int other = color == ArmorColor::Blue
+                ? std::max(red, green) : std::max(green, blue);
+            // A warm/yellow or magenta edge can exceed the average of the
+            // other channels without having the requested light-bar color.
+            // Require resolved dominance over BOTH channels; neutral cores
+            // contribute to the later brightness profile, never color seeds.
+            const bool chromatic = dominant - other >= std::max(4.0F, 0.08F * dominant);
+            if (chromatic && brightness >= config.min_brightness &&
                 response >= config.min_color_response) {
                 mask[index] = 1;
                 responses[index] = response;
@@ -109,10 +118,13 @@ std::vector<RawBar> collect_bars(maix::image::Image &frame,
             double yy_sum = 0.0;
             double xy_sum = 0.0;
             double response_sum = 0.0;
+            bool touches_boundary = false;
             while (cursor < queue.size()) {
                 const int index = queue[cursor++];
                 const int x = index % width;
                 const int y = index / width;
+                touches_boundary = touches_boundary || x == 0 || y == 0 ||
+                    x == width - 1 || y == height - 1;
                 const float weight = std::max(0.01F, responses[index]);
                 ++count;
                 weight_sum += weight;
@@ -142,7 +154,10 @@ std::vector<RawBar> collect_bars(maix::image::Image &frame,
                 }
             }
 
-            if (count < config.min_component_pixels ||
+            // A crop can turn a broad colored surface into an apparently thin
+            // bar. Its extent/PCA are not observable until the component is
+            // fully inside the image; do not rank that artificial geometry.
+            if (touches_boundary || count < config.min_component_pixels ||
                 count > config.max_component_pixels || weight_sum <= 0.0) {
                 continue;
             }
@@ -167,8 +182,164 @@ std::vector<RawBar> collect_bars(maix::image::Image &frame,
                 length / std::max(1.0F, bar_width) < config.min_elongation) {
                 continue;
             }
+            // Apply a necessary pair-geometry bound BEFORE the 24-bar budget.
+            // Otherwise distant saturated clutter can evict both target bars.
+            // The partner's length is at most length / min_length_ratio.
+            const float max_pair_length = 0.5F * (length + std::min(
+                config.max_bar_length_px, length / config.min_length_ratio));
+            float max_pair_separation =
+                config.max_separation_to_length * max_pair_length;
+            if (config.max_separation_to_green_size > 0.0F) {
+                max_pair_separation = std::min(max_pair_separation,
+                    config.max_separation_to_green_size * green.apparent_size);
+            }
+            const float max_green_distance = std::hypot(
+                config.max_green_offset_to_length * max_pair_length,
+                config.max_green_lateral_to_separation * max_pair_separation)
+                + 0.5F * max_pair_separation;
+            if (std::hypot(center_x - green.center_x,
+                           center_y - green.center_y) > max_green_distance) {
+                continue;
+            }
             const float angle = 0.5F * std::atan2(2.0F * cov_xy,
                                                   cov_xx - cov_yy);
+            const float along_x = std::cos(angle), along_y = std::sin(angle);
+            const float across_x = -along_y, across_y = along_x;
+            // Emissive bars form a transverse luminance ridge. Compare their
+            // central band with BOTH adjacent side bands in PCA coordinates,
+            // independent of image roll or which end points toward the lamp.
+            // Read actual RGB here: a white core inside a chromatic component
+            // supplies valid brightness evidence without becoming a gray bar.
+            const auto sample_rgb = [&](float x, float y, std::array<float, 3> &value) {
+                if (x < 0 || y < 0 || x > width - 1 || y > height - 1) return false;
+                const int x0 = static_cast<int>(std::floor(x));
+                const int y0 = static_cast<int>(std::floor(y));
+                const int x1 = std::min(x0 + 1, width - 1);
+                const int y1 = std::min(y0 + 1, height - 1);
+                const float fx = x - x0, fy = y - y0;
+                const auto *p00 = rgb + (static_cast<std::size_t>(y0) * width + x0) * 3;
+                const auto *p10 = rgb + (static_cast<std::size_t>(y0) * width + x1) * 3;
+                const auto *p01 = rgb + (static_cast<std::size_t>(y1) * width + x0) * 3;
+                const auto *p11 = rgb + (static_cast<std::size_t>(y1) * width + x1) * 3;
+                for (int c = 0; c < 3; ++c)
+                    value[c] = (1 - fy) * ((1 - fx) * p00[c] + fx * p10[c]) +
+                        fy * ((1 - fx) * p01[c] + fx * p11[c]);
+                return true;
+            };
+            const auto luma = [](const std::array<float, 3> &p) {
+                return (77 * p[0] + 150 * p[1] + 29 * p[2]) / 256;
+            };
+            const auto color_or_core = [&](const std::array<float, 3> &p) {
+                const float dominant = color == ArmorColor::Blue ? p[2] : p[0];
+                const float other = color == ArmorColor::Blue
+                    ? std::max(p[0], p[1]) : std::max(p[1], p[2]);
+                return dominant - other >= std::max(4.0F, 0.08F * dominant) ||
+                    std::min({p[0], p[1], p[2]}) >= 0.90F * std::max({p[0], p[1], p[2]}) ||
+                    (std::min({p[0], p[1], p[2]}) >= 0.65F * std::max({p[0], p[1], p[2]}) &&
+                     dominant + 4 >= other);
+            };
+            // Saturation may leave chroma on only one side of a white core.
+            // Test a bounded set of COMMON transverse offsets at all stations,
+            // nearest first. The ridge must stay connected to the color seed;
+            // isolated neighboring highlights and open bright half-planes fail.
+            constexpr int kProfileSamples = 5;
+            const float search_extent = std::min(32.0F, std::max(6.0F, 1.5F * bar_width));
+            const float shoulder = std::min(64.0F, std::max(6.0F, 1.5F * bar_width + 2));
+            struct ProfileOrigin {
+                float x = 0, y = 0, brightness = 0;
+                bool compatible = false;
+            };
+            std::array<ProfileOrigin, kProfileSamples> origins{};
+            int compatible_origins = 0;
+            for (int sample = 0; sample < kProfileSamples; ++sample) {
+                const float along = (sample - 2) * 0.15F * length;
+                auto &origin = origins[sample];
+                origin.x = center_x + along * along_x;
+                origin.y = center_y + along * along_y;
+                std::array<float, 3> value{};
+                const bool valid = sample_rgb(origin.x, origin.y, value);
+                origin.brightness = luma(value);
+                origin.compatible = valid && color_or_core(value) && origin.brightness >= 4;
+                compatible_origins += origin.compatible;
+            }
+            // Every allowed path includes its origin and has a >=4 noise
+            // floor. If fewer than three origins qualify, no shift or shoulder
+            // can satisfy the existing three-station requirement.
+            if (compatible_origins < 3) continue;
+            bool luminous_ridge = false;
+            for (int trial = 0; trial < 13 && !luminous_ridge; ++trial) {
+                const int step = (trial + 1) / 2;
+                const float shift = trial == 0 ? 0 :
+                    (trial % 2 ? -1.0F : 1.0F) * step * search_extent / 6;
+                struct Station {
+                    float x = 0, y = 0, central = 0;
+                    bool complete_center = true, connected = false;
+                };
+                std::array<Station, kProfileSamples> stations{};
+                // The central band and color/core connection do not depend
+                // on shoulder distance. Compute them once for both tests.
+                for (int sample = 0; sample < kProfileSamples; ++sample) {
+                    const auto &origin = origins[sample];
+                    const float original_x = origin.x, original_y = origin.y;
+                    auto &station = stations[sample];
+                    station.x = original_x + shift * across_x;
+                    station.y = original_y + shift * across_y;
+                    std::array<float, 3> peak{};
+                    const bool peak_valid = sample_rgb(station.x, station.y, peak);
+                    station.connected = peak_valid && color_or_core(peak) && origin.compatible;
+                    for (float offset : {-0.20F * bar_width, 0.0F, 0.20F * bar_width}) {
+                        std::array<float, 3> value{};
+                        bool valid;
+                        if (offset == 0) { value = peak; valid = peak_valid; }
+                        else valid = sample_rgb(station.x + offset * across_x,
+                            station.y + offset * across_y, value);
+                        station.complete_center = valid && station.complete_center;
+                        station.central += luma(value) / 3;
+                    }
+                    // Do not jump across a dark or differently colored gap to
+                    // borrow another object's highlight as the lamp's core.
+                    const int path_steps = std::max(1, static_cast<int>(std::ceil(std::fabs(shift))));
+                    const float path_floor = std::max(4.0F,
+                        0.75F * std::min(origin.brightness, luma(peak)));
+                    for (int path = 1; path <= path_steps && station.connected; ++path) {
+                        const float offset = shift * path / path_steps;
+                        std::array<float, 3> value{};
+                        station.connected = sample_rgb(original_x + offset * across_x,
+                            original_y + offset * across_y, value) && color_or_core(value) &&
+                            luma(value) >= path_floor;
+                    }
+                }
+                for (int band = 0; band < 2 && !luminous_ridge; ++band) {
+                    const float side_near = band ? shoulder : 0.50F * bar_width + 1;
+                    const float side_far = band ? shoulder + std::max(1.0F, 0.25F * bar_width)
+                        : 0.75F * bar_width + 1;
+                    double center_sum = 0, left_sum = 0, right_sum = 0;
+                    int supported_stations = 0;
+                    bool complete_profile = true;
+                    for (const auto &station : stations) {
+                        complete_profile = station.complete_center && complete_profile;
+                        float left = 0, right = 0;
+                        for (float offset : {side_near, side_far}) {
+                            std::array<float, 3> l{}, r{};
+                            complete_profile = sample_rgb(station.x - offset * across_x,
+                                station.y - offset * across_y, l) && complete_profile;
+                            complete_profile = sample_rgb(station.x + offset * across_x,
+                                station.y + offset * across_y, r) && complete_profile;
+                            left += luma(l) / 2; right += luma(r) / 2;
+                        }
+                        const float minimum_contrast = std::max(4.0F, 0.12F * station.central);
+                        supported_stations += station.connected && station.central - left >= minimum_contrast &&
+                            station.central - right >= minimum_contrast;
+                        center_sum += station.central; left_sum += left; right_sum += right;
+                    }
+                    const double minimum_mean_contrast = std::max(4.0,
+                        0.12 * center_sum / kProfileSamples);
+                    luminous_ridge = complete_profile && supported_stations >= 3 &&
+                        (center_sum - left_sum) / kProfileSamples >= minimum_mean_contrast &&
+                        (center_sum - right_sum) / kProfileSamples >= minimum_mean_contrast;
+                }
+            }
+            if (!luminous_ridge) continue;
             const float elongation_score = clamp01(
                 (length / std::max(1.0F, bar_width) - config.min_elongation) /
                 4.0F);
@@ -219,8 +390,11 @@ ArmorDetection detect_armor_for_color(maix::image::Image &frame,
                                       ArmorColor color)
 {
     ArmorDetection best;
-    const auto bars = collect_bars(frame, config, color);
-    if (bars.size() < 2U || green.apparent_size <= 0.0F) {
+    if (green.apparent_size <= 0.0F) {
+        return best;
+    }
+    const auto bars = collect_bars(frame, config, green, color);
+    if (bars.size() < 2U) {
         return best;
     }
 
@@ -247,6 +421,11 @@ ArmorDetection detect_armor_for_color(maix::image::Image &frame,
                 continue;
             }
             const float separation = distance(first.center, second.center);
+            if (config.max_separation_to_green_size > 0.0F &&
+                separation > config.max_separation_to_green_size *
+                                 green.apparent_size) {
+                continue;
+            }
             const float separation_ratio = separation /
                                            std::max(1.0F, average_length);
             if (separation_ratio < config.min_separation_to_length ||
@@ -269,6 +448,16 @@ ArmorDetection detect_armor_for_color(maix::image::Image &frame,
             }
             down_x /= down_norm;
             down_y /= down_norm;
+            // Parallel components also occur as fragments of ONE light bar.
+            // A real pair must be side by side in its own (roll-invariant)
+            // coordinates; angle and Euclidean separation alone do not prove it.
+            const float pair_longitudinal = std::fabs(
+                (second.center.x - first.center.x) * down_x +
+                (second.center.y - first.center.y) * down_y) /
+                std::max(1.0F, average_length);
+            if (pair_longitudinal > config.max_pair_longitudinal_to_length) {
+                continue;
+            }
             const Point2f armor_center = point(
                 0.5F * (first.center.x + second.center.x),
                 0.5F * (first.center.y + second.center.y));
@@ -345,6 +534,45 @@ ArmorDetection detect_armor(maix::image::Image &frame,
     ArmorDetection blue = detect_armor_for_color(frame, config, green,
                                                  ArmorColor::Blue);
     return blue.geometry_confidence > red.geometry_confidence ? blue : red;
+}
+
+bool same_armor_geometry(const ArmorDetection &previous,
+                         const Point2f &previous_green,
+                         const ArmorDetection &current,
+                         const Point2f &current_green,
+                         const ArmorConfig &config)
+{
+    if (!previous.valid || !current.valid || !previous_green.valid ||
+        !current_green.valid || previous.color != current.color) {
+        return false;
+    }
+    const auto similar_scale = [&config](float a, float b) {
+        return a > 0.0F && b > 0.0F &&
+               std::min(a, b) / std::max(a, b) >= config.min_length_ratio;
+    };
+    const float previous_length =
+        0.5F * (previous.left_bar.length + previous.right_bar.length);
+    const float current_length =
+        0.5F * (current.left_bar.length + current.right_bar.length);
+    if (!similar_scale(previous.separation_px, current.separation_px) ||
+        !similar_scale(previous_length, current_length)) {
+        return false;
+    }
+    // Compare relative change, never an absolute image direction. The pair
+    // solver orients both bar axes toward the green lamp, removing PCA sign
+    // ambiguity while retaining targets at any static camera roll.
+    const float angle_delta = current.left_bar.angle_rad - previous.left_bar.angle_rad;
+    const float cosine = std::cos(angle_delta), sine = std::sin(angle_delta);
+    if (cosine < std::cos(config.max_pair_angle_deg * kPi / 180.0F)) {
+        return false;
+    }
+    const float scale = current.separation_px / previous.separation_px;
+    const float dx = previous.center.x - previous_green.x;
+    const float dy = previous.center.y - previous_green.y;
+    const float expected_x = current_green.x + scale * (cosine * dx - sine * dy);
+    const float expected_y = current_green.y + scale * (sine * dx + cosine * dy);
+    return std::hypot(current.center.x - expected_x, current.center.y - expected_y) <=
+        std::max(2.0F, config.max_green_lateral_to_separation * current.separation_px);
 }
 
 bool solve_8x8(float matrix[8][9], std::array<float, 8> &solution)
@@ -689,14 +917,39 @@ TargetEstimate GreenLightDetector::process(
     result.measurement_age_us = result.green.measurement_age_us;
     result.predicted = result.green.predicted;
 
-    if ((region_active_ && region_force_armor_) || result.green.apparent_size >= armor_config_.min_green_size_px) {
+    const auto clear_armor_candidate = [this]() {
+        armor_candidate_detection_ = ArmorDetection{};
+        armor_candidate_green_center_ = Point2f{};
+        armor_candidate_timestamp_us_ = 0;
+        armor_candidate_hits_ = 0;
+    };
+    const bool green_present = result.green.state != TrackState::Lost &&
+                               result.green.apparent_size > 0.0F;
+    // Candidate acquisition is not a confirmed geometric anchor. Preserve its
+    // green cadence instead of spending the frame budget scanning paired bars.
+    // Explicit diagnostic scans may still run below, but cannot add armor hits.
+    const bool usable_green_anchor = green_present && result.green.valid &&
+        ((!result.green.predicted && result.classical_detection_ran) ||
+         (result.green.valid && result.green.predicted &&
+          result.green.measurement_age_us <=
+              static_cast<uint64_t>(config_.prediction_max_age_ms) * 1000U));
+    const bool forced_scan = region_active_ && region_force_armor_;
+    if (armor_candidate_detection_.valid &&
+        (timestamp_us < armor_candidate_timestamp_us_ ||
+         timestamp_us - armor_candidate_timestamp_us_ >
+             static_cast<uint64_t>(armor_config_.confirmation_max_gap_ms) * 1000U)) {
+        clear_armor_candidate();
+    }
+    if (forced_scan || (usable_green_anchor &&
+                       result.green.apparent_size >= armor_config_.min_green_size_px)) {
         const int effective_classical_interval = npu_config_.enabled
             ? std::max(2, config_.classical_interval_frames)
             : config_.classical_interval_frames;
-        const bool armor_scheduler_slot =
-            effective_classical_interval <= 1 ||
-            (npu_config_.enabled ? last_classical_detection_ran_
-                                 : !last_classical_detection_ran_);
+        const bool armor_scheduler_slot = effective_classical_interval <= 1 ||
+            (npu_config_.enabled ? last_classical_detection_ran_ : !last_classical_detection_ran_);
+        // Preserve the existing interleaved schedule. A fresh pair can use a
+        // short, valid green prediction as a geometric reference; prediction
+        // alone or a skipped scan never adds an armor hit or renews its age.
         if (armor_scheduler_slot && (!region_active_ || region_run_armor_)) {
             result.armor_detection_ran = true;
             auto local_green = result.green;
@@ -704,16 +957,42 @@ TargetEstimate GreenLightDetector::process(
                 local_green.center_x -= region_.x; local_green.center_y -= region_.y;
                 local_green.bbox_x -= region_.x; local_green.bbox_y -= region_.y;
             }
-            last_armor_detection_ = detect_armor(frame, armor_config_, local_green);
+            auto detected = detect_armor(frame, armor_config_, local_green);
             if (region_active_) {
                 auto translate = [this](Point2f &p) { if (p.valid) { p.x += region_.x; p.y += region_.y; } };
-                auto &a = last_armor_detection_;
+                auto &a = detected;
                 translate(a.center);
                 for (auto *bar : {&a.left_bar, &a.right_bar}) {
                     translate(bar->top); translate(bar->bottom); translate(bar->center);
                 }
             }
-            last_armor_timestamp_us_ = timestamp_us;
+            // A failed or inconsistent scan must not masquerade as a fresh
+            // copy of the old cache: downstream source timestamps distinguish
+            // actual scans from intentional cache-only scheduling slots.
+            last_armor_detection_ = ArmorDetection{};
+            last_armor_timestamp_us_ = 0;
+            if (usable_green_anchor && detected.valid) {
+                const auto green_center = point(result.green.center_x, result.green.center_y);
+                const bool newer = !armor_candidate_detection_.valid ||
+                                   timestamp_us > armor_candidate_timestamp_us_;
+                if (newer) {
+                    const bool consistent = same_armor_geometry(armor_candidate_detection_,
+                        armor_candidate_green_center_, detected, green_center, armor_config_);
+                    armor_candidate_hits_ = consistent
+                        ? std::min(armor_candidate_hits_ + 1,
+                            std::max(armor_config_.confirmation_hits, armor_config_.required_pose_hits))
+                        : 1;
+                    armor_candidate_detection_ = detected;
+                    armor_candidate_green_center_ = green_center;
+                    armor_candidate_timestamp_us_ = timestamp_us;
+                    if (armor_candidate_hits_ >= armor_config_.confirmation_hits) {
+                        last_armor_detection_ = detected;
+                        last_armor_timestamp_us_ = timestamp_us;
+                    }
+                }
+            } else {
+                clear_armor_candidate();
+            }
         }
         const uint64_t armor_cache_age_us =
             timestamp_us >= last_armor_timestamp_us_
@@ -725,6 +1004,7 @@ TargetEstimate GreenLightDetector::process(
             result.armor = last_armor_detection_;
         }
     } else {
+        clear_armor_candidate();
         last_armor_detection_ = ArmorDetection{};
         last_armor_timestamp_us_ = 0;
     }
@@ -798,7 +1078,12 @@ TargetEstimate GreenLightDetector::process(
     }
 
     if (result.armor.valid) {
-        if (!region_active_ || result.armor_detection_ran) ++armor_pose_hits_;
+        // Classical confirmation already counted the coherent observations;
+        // do not impose a second identical hit delay before fusion/pose use.
+        if (result.armor_detection_ran && armor_candidate_hits_ > 0)
+            armor_pose_hits_ = armor_candidate_hits_;
+        else if (result.model_ran)
+            ++armor_pose_hits_;
     } else {
         armor_pose_hits_ = 0;
         armor_blend_start_us_ = 0;

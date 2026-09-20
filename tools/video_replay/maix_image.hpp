@@ -50,6 +50,7 @@ private:
 class Image {
 public:
     explicit Image(const cv::Mat &rgb888);
+    Image(int width, int height, Format format);
 
     Format format();
     int width();

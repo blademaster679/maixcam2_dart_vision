@@ -2,6 +2,7 @@
 #include "dart/async_log.hpp"
 #include "dart/target_json.hpp"
 #include "dart/visual_motion.hpp"
+#include "dart/roi_scheduler.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -34,30 +35,94 @@ CandidateRoi source_roi(float x,float y,int size,int w,int h) {
 }
 std::vector<Point2f> nv21_green_proposals(const Nv21View &v) {
     v.validate();
-    // 2x2 chroma grid, max luma within each cell protects tiny bright lamps.
-    // Bounded tile maxima: no full-frame RGB allocation or connected-component map.
+    // Search on the native 2x2 chroma grid. A strict green surplus penalizes
+    // yellow/cyan surfaces which can score highly under 2G-R-B. This is only
+    // proposal ranking: RGB appearance verification still decides lamp validity.
     struct Peak { int score=0,x=0,y=0; };
+    const int width=v.width/2, height=v.height/2;
     const int cols=(v.width+63)/64, rows=(v.height+63)/64;
-    std::vector<Peak> tiles(cols*rows);
-    for(int y=0;y<v.height;y+=2) for(int x=0;x<v.width;x+=2) {
-        const auto *uv=v.vu+(y/2)*v.vu_stride+x;
+    std::vector<uint8_t> response(static_cast<std::size_t>(width)*height,0);
+    std::vector<uint8_t> brightest(response.size(),0);
+    for(int y=0;y<height;++y) for(int x=0;x<width;++x) {
+        const auto *uv=v.vu+y*v.vu_stride+2*x;
         if(uv[0]>=128 || uv[1]>=128) continue;
-        int best_y=0,bx=x,by=y;
+        int best_y=0,offset=0;
         for(int dy=0;dy<2;++dy) for(int dx=0;dx<2;++dx) {
-            int l=v.y[(y+dy)*v.y_stride+x+dx];
-            if(l>best_y){best_y=l;bx=x+dx;by=y+dy;}
+            const int l=v.y[(2*y+dy)*v.y_stride+2*x+dx];
+            if(l>best_y){best_y=l;offset=dy*2+dx;}
         }
         uint8_t color[3];rgb(best_y,uv[0],uv[1],color);
-        const int response=2*color[1]-color[0]-color[2];
-        if(color[1]<40 || response<35 || 100*color[1]<42*(color[0]+color[1]+color[2])) continue;
-        auto &p=tiles[(y/64)*cols+x/64];
-        if(response>p.score) p={response,bx,by};
+        const int green=color[1]-std::max(color[0],color[2]);
+        if(color[1]<40 || green<8 || 2*color[1]-color[0]-color[2]<35 ||
+           100*color[1]<42*(color[0]+color[1]+color[2])) continue;
+        response[y*width+x]=static_cast<uint8_t>(green);
+        brightest[y*width+x]=static_cast<uint8_t>(offset);
     }
-    std::sort(tiles.begin(),tiles.end(),[](const Peak&a,const Peak&b){return a.score>b.score;});
+    // A fixed shortlist bounds the expensive ring work even on dense texture:
+    // one local peak per 32px cell, then the existing final 64px tile budget.
+    const int fine_cols=(v.width+31)/32, fine_rows=(v.height+31)/32;
+    std::vector<Peak> shortlist(fine_cols*fine_rows);
+    for(int y=0;y<height;++y) for(int x=0;x<width;++x) {
+        const int value=response[y*width+x];
+        if(!value) continue;
+        // Reject flat interiors and non-maxima before the multi-scale checks.
+        // Keep plateau boundaries so a small uniformly lit LED still proposes.
+        bool maximum=true,has_lower=false;
+        for(int dy=-1;dy<=1 && maximum;++dy) for(int dx=-1;dx<=1;++dx) {
+            const int xx=x+dx,yy=y+dy;
+            if(xx<0 || yy<0 || xx>=width || yy>=height) continue;
+            const int neighbor=response[yy*width+xx];
+            if(neighbor>value){maximum=false;break;}
+            has_lower=has_lower || neighbor<value;
+        }
+        if(!maximum || !has_lower) continue;
+        auto &peak=shortlist[(y/16)*fine_cols+x/16];
+        if(value>peak.score) peak={value,x,y};
+    }
+    std::vector<Peak> tiles(cols*rows);
+    for(const auto &peak:shortlist) {
+        if(!peak.score) continue;
+        const int x=peak.x,y=peak.y,value=peak.score;
+        int local_contrast=0;
+        // 4/8/16/32 source-pixel radii. At least 7/8 surrounding directions
+        // must be less green, unlike a flat region or straight surface edge.
+        // The ring reaches beyond a saturated white core and its green fringe.
+        for(const int radius:{2,4,8,16}) {
+            const int diagonal=std::max(1,static_cast<int>(std::lround(radius*0.70710678)));
+            const int dx[]={radius,diagonal,0,-diagonal,-radius,-diagonal,0,diagonal};
+            const int dy[]={0,diagonal,radius,diagonal,0,-diagonal,-radius,-diagonal};
+            int valid=0,support=0,contrast=0;
+            for(int k=0;k<8;++k) {
+                const int xx=x+dx[k],yy=y+dy[k];
+                if(xx<0 || yy<0 || xx>=width || yy>=height) continue;
+                ++valid;
+                const int difference=value-response[yy*width+xx];
+                support+=difference>=std::max(6,value/8);
+                contrast+=std::max(0,difference);
+            }
+            if(valid>=6 && support*8>=valid*7)
+                local_contrast=std::max(local_contrast,contrast/valid);
+        }
+        if(!local_contrast) continue;
+        const int offset=brightest[y*width+x];
+        const int bx=2*x+offset%2,by=2*y+offset/2;
+        const int score=4*local_contrast+value;
+        auto &p=tiles[(by/64)*cols+bx/64];
+        if(score>p.score) p={score,bx,by};
+    }
+    std::sort(tiles.begin(),tiles.end(),[](const Peak&a,const Peak&b){
+        if(a.score!=b.score) return a.score>b.score;
+        if(a.y!=b.y) return a.y<b.y;
+        return a.x<b.x;
+    });
     std::vector<Point2f> result;
     for(const auto &p:tiles) {
         if(!p.score || result.size()==5) break;
-        bool close=false; for(const auto&q:result) if(std::hypot(q.x-p.x,q.y-p.y)<48) close=true;
+        bool close=false;
+        for(const auto&q:result) {
+            const float dx=q.x-p.x,dy=q.y-p.y;
+            if(dx*dx+dy*dy<48*48) close=true;
+        }
         if(!close) result.push_back({static_cast<float>(p.x),static_cast<float>(p.y),true});
     }
     return result;
@@ -107,7 +172,7 @@ TargetEstimate predict_full180_output(const TargetEstimate &source,
         t.state=t.measurement_age_us>=500000 ? GuidanceTrackState::Search : GuidanceTrackState::Reacquire;
     invalidate_uncalibrated(t);return t;
 }
-HighFpsPipeline::HighFpsPipeline(const ApplicationConfig &c,bool idle,bool stress):config_(c),idle_(idle),stress_(stress) {
+HighFpsPipeline::HighFpsPipeline(const ApplicationConfig &c,bool idle,bool stress,PipelineInputSource source):config_(c),idle_(idle),stress_(stress),input_source_(source) {
     if(c.camera.width!=1344 || c.camera.height!=760 || c.camera.fps!=180 ||
        c.npu.enabled || c.target_geometry.pose_enabled || c.detector.classical_interval_frames!=1)
         throw std::invalid_argument("full180 pipeline requires 1344x760@180, per-observation detector, NPU/pose disabled");
@@ -137,7 +202,8 @@ void HighFpsPipeline::finish() {
     const auto fs=frames_.stats();
     std::lock_guard<std::mutex> lock(stats_mutex_);
     std::ofstream summary("business.json");
-    summary << "{\"received\":"<<sequence_.received<<",\"slot_replaced\":"<<fs.replaced
+    summary << "{\"input_source\":\""<<(input_source_==PipelineInputSource::Vin?"vin":"nv21_cached_video")
+        <<"\",\"received\":"<<sequence_.received<<",\"slot_replaced\":"<<fs.replaced
         <<",\"scheduled_skipped\":"<<scheduled_skipped_<<",\"shutdown_discarded\":"<<fs.shutdown_discarded
         <<",\"slot_taken\":"<<fs.taken<<",\"upstream_missing\":"<<sequence_.missing
         <<",\"upstream_duplicate\":"<<sequence_.duplicate<<",\"upstream_reversed\":"<<sequence_.reversed
@@ -160,26 +226,25 @@ void HighFpsPipeline::vision_loop() {
         std::vector<Point2f> proposals;
         TargetEstimate last;
         uint64_t armor_source=0;
-        size_t cursor=0;
+        RoiScheduler roi_scheduler(config_.detector,config_.highfps.green_hz);
         AsyncLog log("vision.csv");
-        log<<"sequence,pts_raw,received_us,started_us,finished_us,search_ran,green_ran,armor_ran,motion_ran,search_us,roi_convert_us,detect_us,motion_us,direct_green,green_us\n";
+        log<<"sequence,pts_raw,received_us,started_us,finished_us,search_ran,green_ran,armor_ran,motion_ran,search_us,roi_convert_us,detect_us,motion_us,direct_green,green_us,roi_x,roi_y,roi_width,roi_height,proposal_count,green_state,green_valid,green_predicted,green_x,green_y,green_size,armor_valid,roi_mode,roi_tracker_reset\n";
         while(auto f=frames_.wait()) {
             if(stopped_) break;
             const auto started=monotonic_us();
             if(idle_ || !measurement.due(f->metadata.received_us)) { ++scheduled_skipped_; continue; }
             const auto v=f->map();
             if(v.width!=1344 || v.height!=760) throw std::runtime_error("unexpected business source dimensions");
+            auto prediction=detector.tracker_snapshot(); prediction.predict(f->metadata.received_us);
             const auto search_start=monotonic_us();
-            const bool full=search.due(f->metadata.received_us);
+            const bool scheduled_search=search.due(f->metadata.received_us);
+            const bool full=scheduled_search || roi_scheduler.needs_global_search(f->metadata.received_us,prediction);
             if(full) proposals=nv21_green_proposals(v);
             const auto search_end=monotonic_us();
-            auto prediction=detector.tracker_snapshot(); prediction.predict(f->metadata.received_us);
-            Point2f center{v.width/2.0F,v.height/2.0F,true};
-            const bool tracked=last.green.valid && !last.green.predicted;
-            if(tracked) center={prediction.predicted_x(),prediction.predicted_y(),true};
-            else if(!proposals.empty()) center=proposals[cursor++%proposals.size()];
-            const int size=tracked ? std::clamp(static_cast<int>(last.green.apparent_size*12),128,384) : 96;
-            const auto roi=source_roi(center.x,center.y,size,v.width,v.height);
+            const auto selection=roi_scheduler.select(proposals,prediction,f->metadata.received_us,v.width,v.height);
+            if(selection.reset_tracker) detector.reset();
+            const bool tracked=selection.mode==RoiMode::Tracking || selection.mode==RoiMode::Coasting;
+            const auto roi=selection.roi;
             const auto convert_start=monotonic_us();
             auto image=nv21_rgb_region(v,roi);
             const auto convert_end=monotonic_us();
@@ -204,6 +269,7 @@ void HighFpsPipeline::vision_loop() {
             const auto motion_end=monotonic_us();
             const auto detect_start=monotonic_us();
             last=detector.process_region(*image,roi,v.width,v.height,f->metadata.received_us,prior.valid?&prior:nullptr,stress_,armor_schedule.due(f->metadata.received_us));
+            roi_scheduler.observe(last.green,f->metadata.received_us,last.classical_detection_ran);
             const auto finished=monotonic_us();
             if(last.armor_detection_ran) armor_source=last.armor.valid ? f->metadata.received_us : 0;
             last.armor_source_received_us=last.armor.valid ? armor_source : 0;
@@ -214,7 +280,11 @@ void HighFpsPipeline::vision_loop() {
             invalidate_uncalibrated(last); snapshot->target=last; estimates_.publish(snapshot);
             const bool armor_ran=last.armor_detection_ran;
             ++vision_count_; if(last.classical_detection_ran) ++green_count_; if(armor_ran) ++armor_count_;
-            log<<f->metadata.sequence<<','<<f->metadata.pts_raw<<','<<f->metadata.received_us<<','<<started<<','<<finished<<','<<full<<",1,"<<armor_ran<<','<<motion_ran<<','<<search_end-search_start<<','<<convert_end-convert_start<<','<<finished-detect_start<<','<<motion_end-motion_start<<','<<(last.green.valid&&!last.green.predicted)<<','<<last.classical_detection_ms*1000<<'\n';
+            log<<f->metadata.sequence<<','<<f->metadata.pts_raw<<','<<f->metadata.received_us<<','<<started<<','<<finished<<','<<full<<",1,"<<armor_ran<<','<<motion_ran<<','<<search_end-search_start<<','<<convert_end-convert_start<<','<<finished-detect_start<<','<<motion_end-motion_start<<','<<(last.green.valid&&!last.green.predicted)<<','<<last.classical_detection_ms*1000
+                <<','<<roi.x<<','<<roi.y<<','<<roi.width<<','<<roi.height<<','<<proposals.size()
+                <<','<<static_cast<int>(last.green.state)<<','<<last.green.valid<<','<<last.green.predicted
+                <<','<<last.green.center_x<<','<<last.green.center_y<<','<<last.green.apparent_size<<','<<last.armor.valid
+                <<','<<static_cast<int>(selection.mode)<<','<<selection.reset_tracker<<'\n';
             if(!log) throw std::runtime_error("vision metrics write failed");
         }
         log.finish(); if(!log) throw std::runtime_error("vision metrics flush failed");
@@ -257,7 +327,10 @@ void HighFpsPipeline::control_loop() {
             {std::lock_guard<std::mutex> lock(stats_mutex_);
              t.upstream_missing=sequence_.missing;t.upstream_duplicate=sequence_.duplicate;t.upstream_reversed=sequence_.reversed;}
             t.application_dropped=frames_.stats().replaced+scheduled_skipped_.load();
-            write_target_estimate_json(log,t,nullptr,",\"timestamp_source\":\"host_monotonic_output\",\"measurement_timestamp_source\":\"VIN_receive_host_monotonic\",\"pts_event\":\"SDK_payload_unknown_exposure_phase\",\"exposure_age_valid\":false");
+            const char *source_fields=input_source_==PipelineInputSource::Vin
+                ? ",\"timestamp_source\":\"host_monotonic_output\",\"measurement_timestamp_source\":\"VIN_receive_host_monotonic\",\"pts_event\":\"SDK_payload_unknown_exposure_phase\",\"exposure_age_valid\":false"
+                : ",\"timestamp_source\":\"host_monotonic_output\",\"measurement_timestamp_source\":\"cached_video_submit_host_monotonic\",\"pts_event\":\"synthetic_monotonic_replay_tick_us\",\"exposure_age_valid\":false,\"replay_diagnostic_only\":true";
+            write_target_estimate_json(log,t,nullptr,source_fields);
             log<<'\n'; ++output_count_;
             if(!log) throw std::runtime_error("control metrics write failed");
             const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-origin).count();
