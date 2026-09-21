@@ -28,7 +28,7 @@
 
 - 用户表示已经有线连接 MaixCAM2，并换装 OS04A10。
 - “查询Maixcam2相机型号”对话正文未出现在当前上下文；没有声称已读取该对话。
-- 项目 `/home/blade_master/pnx/maixcam2_dart/README.md` 的“OS04A10 360 FPS 独立研发线”记录了 RAW/NV21、模式资料和分阶段验收的初步方案。
+- 项目 `/home/blade_master/pnx/maixcam2_dart_vision/README.md` 的“OS04A10 360 FPS 独立研发线”记录了 RAW/NV21、模式资料和分阶段验收的初步方案。
 - 旧项目记录是 OS04D10、系统 `maixcam2-2026-05-29-maixpy-v4.12.5`、MaixPy `4.12.5`；这些不是现在 OS04A10 的实测基线。
 - 暂定 360p 为 640×360，优先帧率且允许 sensor ROI 裁剪；视野偏好未确认，模式论证中同时评估保留视野方案。
 - 对历史 USB 地址 `root@10.18.197.1` 的只读 SSH 尝试得到 `Permission denied (publickey,password)`。这只能证明该地址 SSH 服务响应，不能证明已登录或核验了设备身份。需使用用户现有连接方式，不猜密码、不收集私钥。

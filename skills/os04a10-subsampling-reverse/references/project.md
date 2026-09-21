@@ -4,7 +4,7 @@
 
 | 项目 | 锚点 |
 | --- | --- |
-| 用户项目 | `/home/blade_master/pnx/maixcam2_dart` |
+| 用户项目 | `/home/blade_master/pnx/maixcam2_dart_vision` |
 | MaixCDK | `/home/blade_master/maix/MaixCDK`，此前commit `2a0502ecb20e5695b28580b3689492b7a228f9e4` |
 | MSP | `3.0.0_20250319114413`，Axera/AX630C平台 |
 | 设备连接 | 项目 `.maixpy/` 配置，MaixPy helper；此前有线地址10.18.197.1 |

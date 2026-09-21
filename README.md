@@ -178,7 +178,7 @@ source ~/maix/maixcdk-venv/bin/activate
 export MAIXCDK_PATH=~/maix/MaixCDK
 # USB 有线连接；若使用 Windows 网络共享则换成实际的 192.168.137.x
 export MAIXCAM2_HOST=10.18.197.1
-cd /home/blade_master/pnx/maixcam2_dart
+cd /home/blade_master/pnx/maixcam2_dart_vision
 ```
 
 也可以把前两条环境命令加入 `~/.bashrc`。比赛版本应固定与板端 MaixPy 对应的

@@ -1,7 +1,7 @@
 # MaixCAM2 飞镖视觉项目：会话导出与跨对话交接
 
 生成时间：2026-09-08（Asia/Shanghai）  
-工作区：`/home/blade_master/pnx/maixcam2_dart`  
+工作区：`/home/blade_master/pnx/maixcam2_dart_vision`
 用途：将本文件上传到另一个对话，或让同一 Codex 工作区中的新对话先读取本文件。
 
 > 说明：这是根据当前对话中可见的消息、仓库文档和 Git 状态整理出的结构化导出，
@@ -15,7 +15,7 @@
 ```text
 请继续 MaixCAM2 RoboMaster 飞镖视觉项目。
 
-工作区为 /home/blade_master/pnx/maixcam2_dart。
+工作区为 /home/blade_master/pnx/maixcam2_dart_vision。
 请先完整阅读：
 1. docs/CONVERSATION_HANDOFF_2026-09-08.md
 2. README.md
@@ -173,7 +173,7 @@ AX_VIN_SetPipeSourceDepth(0, AX_VIN_FRAME_SOURCE_ID_ITP, 4);
 source ~/maix/maixcdk-venv/bin/activate
 export MAIXCDK_PATH=~/maix/MaixCDK
 export MAIXCAM2_HOST=10.18.197.1
-cd /home/blade_master/pnx/maixcam2_dart
+cd /home/blade_master/pnx/maixcam2_dart_vision
 ```
 
 比赛构建应固定与板端 MaixPy 对应的 MaixCDK commit，防止 API/ABI 随升级变化。已记录的
