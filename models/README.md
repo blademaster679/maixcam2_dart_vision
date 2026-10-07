@@ -15,6 +15,23 @@ Use visibility `0` for unavailable distant bar endpoints, `1` for
 occluded/partly reliable points, and `2` for visible points. Horizontal flips
 must use `flip_idx: [0, 3, 4, 1, 2]`.
 
+For the October 2026 green-center handoff, only keypoint 0 is supervised.
+Set `npu.center_only=true` and `npu.input_size=320` for these models. This
+discards points 1–4 and prevents a center-only prediction from creating or
+validating armor geometry. The original five-point models retain the default
+`npu.center_only=false`. The high-FPS NV21 pipeline still rejects NPU models;
+these settings apply to the normal RGB application and image replay only.
+The MUD must enable `input_cache_flush = true` when feeding CPU-preprocessed
+RGB crops. Board replay found inconsistent predictions with the handoff's
+original `false` setting. Center-only inference uses explicit bilinear resize
+and padding value 114, then maps keypoint 0 back into source coordinates.
+
+`tools/model/train_center_handoff.py` creates a separate continuation experiment
+without replacing the original weights. `prepare_center_replay.py`,
+`pc_center_replay.py`, `board_center_replay.py`, and `score_center_replay.py`
+provide matching PC/board image replay and scoring. Replay uses stored proposals
+and must not be reported as live camera end-to-end accuracy or capture FPS.
+
 Workflow:
 
 ```bash

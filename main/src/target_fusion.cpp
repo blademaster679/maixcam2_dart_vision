@@ -1040,6 +1040,10 @@ TargetEstimate GreenLightDetector::process(
             candidate.apparent_size, frame.width(), frame.height(), npu_config_);
         const auto model_started = std::chrono::steady_clock::now();
         last_pose_validation_ = pose_validator_->validate(frame, roi);
+        if (npu_config_.center_only) {
+            for (std::size_t index = 1; index < last_pose_validation_.keypoints.size(); ++index)
+                last_pose_validation_.keypoints[index] = Point2f{};
+        }
         const auto model_finished = std::chrono::steady_clock::now();
         last_model_inference_ms_ = static_cast<float>(
             std::chrono::duration<double, std::milli>(
@@ -1060,11 +1064,12 @@ TargetEstimate GreenLightDetector::process(
         distance(last_pose_validation_.keypoints[0],
                  point(result.green.center_x, result.green.center_y)) <=
             std::max(12.0F, 2.0F * result.green.apparent_size);
-    const bool model_is_recent = last_model_positive_timestamp_us_ > 0 &&
+    const bool model_is_recent = last_pose_validation_.valid &&
+        last_model_positive_timestamp_us_ > 0 &&
         timestamp_us >= last_model_positive_timestamp_us_ &&
         timestamp_us - last_model_positive_timestamp_us_ <= 100000U &&
         model_lamp_consistent;
-    if (model_is_recent && last_pose_validation_.valid) {
+    if (model_is_recent && !npu_config_.center_only) {
         ArmorDetection model_armor = armor_from_validation(last_pose_validation_);
         model_armor.color = armor_config_.expected_color;
         if (model_armor.valid &&
