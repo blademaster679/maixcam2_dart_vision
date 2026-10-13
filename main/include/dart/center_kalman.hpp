@@ -10,6 +10,7 @@ struct SmoothedCenter { bool valid=false,reset=false; double x=0,y=0; };
 class CenterKalman {
  struct Axis {double p=0,v=0,p00=0,p01=0,p11=0;};
  Axis x_,y_;bool initialized_=false;uint64_t timestamp_=0,generation_=0;
+ uint64_t maximum_gap_us_;
  static void predict(Axis &a,double dt) {
   constexpr double q=250000; // continuous white acceleration spectral density
   a.p+=dt*a.v;
@@ -29,11 +30,12 @@ class CenterKalman {
   a.p11=p11-2*k1*p01+k1*k1*(p00+r);
  }
  public:
+ explicit CenterKalman(uint64_t maximum_gap_us=50000):maximum_gap_us_(maximum_gap_us){}
  void reset(){initialized_=false;}
  SmoothedCenter update(bool valid,double x,double y,double diameter,uint64_t ts,uint64_t generation) {
   if(!valid||!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(diameter)) {reset();return {};}
   const double sigma=std::clamp(diameter*.06,1.5,4.0),r=sigma*sigma;
-  if(!initialized_||generation!=generation_||ts<=timestamp_||ts-timestamp_>50000) {
+  if(!initialized_||generation!=generation_||ts<=timestamp_||ts-timestamp_>maximum_gap_us_) {
    x_={x,0,r,0,1000000};y_={y,0,r,0,1000000};initialized_=true;timestamp_=ts;generation_=generation;
    return {true,true,x,y};
   }
