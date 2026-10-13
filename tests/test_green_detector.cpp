@@ -759,6 +759,23 @@ void test_npu_gate_and_control_prediction_budget()
     check(target.valid && !target.safe_for_control,
           "a recent but spatially inconsistent model result cannot validate control");
 
+    npu_config.center_only = true;
+    validator->response.keypoints[0] = {60.0F, 45.0F, true};
+    validator->response.keypoints[1] = {40.0F, 55.0F, true};
+    validator->response.keypoints[2] = {40.0F, 75.0F, true};
+    validator->response.keypoints[3] = {80.0F, 55.0F, true};
+    validator->response.keypoints[4] = {80.0F, 75.0F, true};
+    dart::GreenLightDetector center_detector(detector_config, {}, {}, npu_config, validator);
+    for (int n = 0; n < 6; ++n)
+        target = center_detector.process_target(image, 2000000 + n * 16667);
+    check(target.safe_for_control && !target.armor.valid && !target.pose.valid,
+          "center-only model confirms lamp without inventing armor from untrained points");
+    validator->response.valid = false;
+    center_detector.process_target(image, 2100002);
+    target = center_detector.process_target(image, 2116669);
+    check(target.model_ran && !target.safe_for_control,
+          "negative model result revokes recent center validation even with a valid coordinate");
+
     dart::GreenLightDetector unavailable_model(
         detector_config, {}, {}, npu_config, nullptr);
     unavailable_model.process_target(image, 1000000);
@@ -886,6 +903,7 @@ void test_configuration()
     check(config.detector.enable_normalized_multiscale &&
               !config.detector.enable_legacy_lab_candidates &&
               config.detector.enable_sparse_component_search &&
+              config.detector.integral_peak_statistics &&
               config.detector.multiscale_downsample == 1 &&
               config.detector.multiscale_diameters_px[2] == 6 &&
               std::fabs(config.detector.capture_cone_deg - 6.5F) < 1.0e-6F &&

@@ -345,6 +345,8 @@ struct TargetGeometryConfig {
 struct NpuConfig {
     bool enabled = false;
     bool required = false;
+    // Center-only training leaves the four bar endpoints unsupervised.
+    bool center_only = false;
     std::string model_path = "models/dart_target_pose.mud";
     int input_size = 256;
     int interval_ms = 33;

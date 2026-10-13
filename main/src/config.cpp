@@ -439,6 +439,7 @@ ApplicationConfig load_application_config(const std::string &path)
         else if (key == "multiscale.enabled") config.detector.enable_normalized_multiscale = parse_bool(key, value);
         else if (key == "performance.legacy_lab_candidates_enabled") config.detector.enable_legacy_lab_candidates = parse_bool(key, value);
         else if (key == "performance.sparse_component_search_enabled") config.detector.enable_sparse_component_search = parse_bool(key, value);
+        else if (key == "performance.integral_peak_statistics") config.detector.integral_peak_statistics = parse_bool(key, value);
         else if (key == "multiscale.diameters_px") config.detector.multiscale_diameters_px = parse_five_ints(key, value);
         else if (key == "performance.classical_interval_frames") config.detector.classical_interval_frames = parse_int(key, value);
         else if (key == "performance.multiscale_downsample") config.detector.multiscale_downsample = parse_int(key, value);
@@ -497,6 +498,7 @@ ApplicationConfig load_application_config(const std::string &path)
         else if (key == "target_geometry.min_pose_separation_px") config.target_geometry.min_pose_separation_px = parse_float(key, value);
         else if (key == "npu.enabled") config.npu.enabled = parse_bool(key, value);
         else if (key == "npu.required") config.npu.required = parse_bool(key, value);
+        else if (key == "npu.center_only") config.npu.center_only = parse_bool(key, value);
         else if (key == "npu.model_path") config.npu.model_path = value;
         else if (key == "npu.input_size") config.npu.input_size = parse_int(key, value);
         else if (key == "npu.interval_ms") config.npu.interval_ms = parse_int(key, value);
