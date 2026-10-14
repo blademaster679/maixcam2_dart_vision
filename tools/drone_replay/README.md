@@ -28,7 +28,9 @@ NPU 版本輸入：`uint8 [1,320,320,3]` RGB。將縮放／填充後的 RGB byte
 
 YOLO11 後處理對照 MaixCDK `maix_nn_yolo11.hpp` 的 DFL、sigmoid、NMS
 及關鍵點解碼公式。主機實作不是板端 NPU API；量化模型由 Pulsar2 模擬器
-實際執行。信心門檻 0.5、關鍵點門檻 0.35、NMS 0.45 沿用上游預設。
+實際執行。綠燈中心回放的信心門檻採上游 `board_center_replay.py` 和
+`board_center_validator.cpp` 的 0.3，關鍵點門檻 0.35、NMS 0.45 保持一致。
+這是上游離線回放配置；作者尚未提供此仿真相機的實機部署門檻證據。
 
 官方工具下載：[Pulsar2 6.0](https://huggingface.co/AXERA-TECH/Pulsar2/tree/main/6.0)。
 本機使用 `ax_pulsar2_6.0_lite_package.tar.gz`，SHA256
@@ -100,9 +102,40 @@ DRONE_CORE_LIBRARY="$PWD/artifacts/drone-core-build-new/libdrone_green_core.so" 
 單調來源時間。這是明確的合成重現測試，不是第二次飛行或自然遮擋恢復證據。
 `audit.py` 獨立核對預設第 10–15 幀黑圖區間與重獲；只適用預設 fixture 邊界。
 
-本輪來源短片段 40 幀中，模型肯定 14 次，追蹤輸出有效 17 幀；有效輸出可在
-一次模型否定後短暫保留，因此兩種計數不同。自然遮擋片段後沒有重獲。
-這些是保存輸入的實際結果，沒有降低模型門檻或重新訓練。流程已可回放，
-持續辨識效果仍需研究。
+2026-10-14 核對發現先前 0.5 取自通用 `config/green_detector.conf`，
+作者的中心離線回放工具則使用 0.3。本工具現對齊後者；實際板端部署配置
+尚未取得，不能把這個修正當作實機配置已確認。裁切規則和模型保持原樣。
+
+相同 40 幀／模型張量的結果如下；這些計數沒有人工標註，不能當作準確率。
+
+| 配置 | 模型肯定 | 有效當幀追蹤輸出 | 黑圖後恢復原視角序列 |
+| --- | --- | --- | --- |
+| 舊通用門檻 0.5 | 14/40 | 17/40 | 未重獲 |
+| 上游中心回放門檻 0.3 | 27/40 | 28/40 | 第二幀重新確認 |
+
+有效輸出可在一次模型否定後短暫保留，所以兩種計數不同。新版在第 29–39 幀
+持續失鎖；全部 40 幀都有像素候選，13 次模型拒絕均由分類信心不足引起，
+並非這批输入的關鍵點座標還原或關聯失敗。連續追蹤仍未通過。
+畫面與裁切大小會一起變動，目前不能據此判定是裁切問題或訓練資料差異。
+
+新結果為精確輸入的錄製 AXMODEL 張量回放，重用先前真正執行的 40 次推理；
+本次新推理數為零。`artifacts/drone-replay-center-audit-01/summary.json`
+確認黑圖期間無輸出、原視角恢復和明確合成重現均能重新確認、無目標片段
+保持無效。9 項接口／解碼測試通過。黑圖結果不代表真實干擾物的誤檢率。
+
+診斷入口可輸出實際 320×320 模型輸入、逐幀分數、肯定／拒絕對照圖與
+固定上游來源快照／哈希：
+
+```bash
+/home/shiuhou/venvs/mujoco/bin/python tools/drone_replay/diagnose.py \
+  --run artifacts/drone-green-nominal-01 \
+  --output artifacts/drone-green-diagnose-new
+```
+
+`--run` 必須含完整模型 I/O、jobs、輸入 bytes、輸出張量及
+`inference_manifest.json`。此診斷對照兩個既有來源門檻，不搜尋最佳門檻。
+新證據索引位於 PX4 工作區 `artifacts/green-replay-diagnosis-closeout-01/summary.json`；
+舊輪次與失敗嘗試另行保留。後續需要實機部署配置及帶標註的真實影像／
+訓練資料，才能檢查模型為何拒絕末段仿真視角。
 
 距離、裝甲識別、動態飛行控制、板端即時調度與 OS04A10 成像驗證均待後續研究。

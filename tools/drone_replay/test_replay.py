@@ -94,3 +94,20 @@ def test_maix_pose_equations_and_ignored_armor_keypoints():
     assert result['valid'] and result['center_px'] == [77., 99.]
     outputs[name][0, 20 * 40 + 17, 2] = -20
     assert not decode(outputs, info, transform)['valid']
+
+
+def test_quantized_boundary_score_matches_center_probe_not_generic_template():
+    info = dict(inputs=[dict(shape=[1, 320, 320, 3])], outputs=[])
+    outputs = {}
+    for stride in (8, 16, 32):
+        name = f'maix_det_stride_{stride}'; shape = [1, 320 // stride, 320 // stride, 65]
+        info['outputs'].append(dict(name=name, shape=shape))
+        outputs[name] = np.zeros(shape, np.float32); outputs[name][..., 64] = -20
+    outputs['maix_det_stride_8'][0, 20, 17, 64] = 0
+    info['outputs'].append(dict(name='pose', shape=[1, 2100, 15]))
+    outputs['pose'] = np.zeros((1, 2100, 15), np.float32)
+    outputs['pose'][0, 20 * 40 + 17, :3] = [.125, .375, 8]
+    transform = dict(gain=2., pad_x=4, pad_y=8, left=10, top=20, step=1, crop_width=200, crop_height=200)
+    r = decode(outputs, info, transform, .5)
+    assert not r['valid'] and r['maximum_class_score'] == .5
+    assert decode(outputs, info, transform, .3)['valid']

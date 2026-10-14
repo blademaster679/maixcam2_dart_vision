@@ -101,13 +101,14 @@ def sigmoid(values):
 
 def decode(outputs, info, transform, confidence=.5, keypoint_threshold=.35):
     """MaixCDK YOLO11 NHWC DFL/NMS/pose equations; consume keypoint 0 only."""
-    proposals = []; offset = 0
+    proposals = []; offset = 0; maximum_score = 0.
     pose_info = next(x for x in info['outputs'] if len(x['shape']) == 3)
     keypoints = outputs[pose_info['name']].reshape(pose_info['shape'])[0]
     for stride in (8, 16, 32):
         layer = outputs[f'maix_det_stride_{stride}'].reshape(1, -1, 65)[0]
         grid = info['inputs'][0]['shape'][1] // stride
         scores = sigmoid(layer[:, 64])
+        maximum_score = max(maximum_score, float(scores.max()))
         for anchor in np.flatnonzero(scores > confidence):
             logits = layer[anchor, :64].reshape(4, 16)
             probability = np.exp(logits - logits.max(1, keepdims=True))
@@ -128,18 +129,19 @@ def decode(outputs, info, transform, confidence=.5, keypoint_threshold=.35):
             total = float(np.maximum(box[2:] - box[:2], 0).prod() + np.maximum(other[2:] - other[:2], 0).prod())
             return intersection / max(total - intersection, 1e-12)
         if not any(iou(p[1]) > .45 for p in kept): kept.append(proposal)
-    if not kept: return dict(valid=False, reason='no model detection', confidence=0.)
+    if not kept: return dict(valid=False, reason='no model detection', confidence=0., maximum_class_score=maximum_score)
     score, _, index, ax, ay, stride = kept[0]
     kp = keypoints[index, :3]; kp_score = float(sigmoid(kp[2]))
     if kp_score <= keypoint_threshold:
-        return dict(valid=False, reason='green keypoint confidence', confidence=score, keypoint_confidence=kp_score)
+        return dict(valid=False, reason='green keypoint confidence', confidence=score, keypoint_confidence=kp_score,
+                    maximum_class_score=maximum_score)
     # SDK stores integer keypoint coordinates before source coordinate correction.
     px, py = int((kp[0] * 2 + ax) * stride), int((kp[1] * 2 + ay) * stride)
     local = [(px - transform['pad_x']) / transform['gain'], (py - transform['pad_y']) / transform['gain']]
     valid = 0 <= local[0] < transform['crop_width'] and 0 <= local[1] < transform['crop_height']
     center = [transform['left'] + local[0] * transform['step'], transform['top'] + local[1] * transform['step']]
     return dict(valid=valid, reason='valid' if valid else 'keypoint outside crop', center_px=center,
-                confidence=score, keypoint_confidence=kp_score)
+                confidence=score, keypoint_confidence=kp_score, maximum_class_score=maximum_score)
 
 
 def inspect_model(toolchain, model):

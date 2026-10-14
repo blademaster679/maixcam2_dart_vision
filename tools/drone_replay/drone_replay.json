@@ -1,9 +1,11 @@
 {
   "schema_version": 1,
-  "model_confidence": 0.5,
+  "model_confidence": 0.3,
   "keypoint_confidence": 0.35,
   "maximum_component_aspect": 8.0,
   "model_timeout_s": 600,
   "tracking": "two same-track model confirmations; no predicted observations; expiry and filter gap two source frame periods",
+  "reference": "Upstream fd7ff39 board_center_replay.py and board_center_validator.cpp use conf_th=0.3",
+  "deployment_configuration_verified": false,
   "scope": "Offline RGB green-center replay only; no armor pose or actuator output"
 }
