@@ -139,3 +139,50 @@ DRONE_CORE_LIBRARY="$PWD/artifacts/drone-core-build-new/libdrone_green_core.so" 
 訓練資料，才能檢查模型為何拒絕末段仿真視角。
 
 距離、裝甲識別、動態飛行控制、板端即時調度與 OS04A10 成像驗證均待後續研究。
+
+## 固定影像的 NV21 輸入診斷（2026-10-15）
+
+新增 `input_probe.py`：從錄製推理固定候選及 ROI，將原 RGB 與「主機產生
+NV21、再經原 C++ `nv21_rgb_region` 轉回 RGB」作配對推理。此轉換只用於
+診斷，不改預設回放、場景或控制。它不是實機感測器的原始 NV21，不能代表
+板端成像表現；局部質心和 ROI 故意固定，以單獨檢查模型輸入的影響。
+
+```bash
+cmake -S tools/drone_replay -B artifacts/drone-probe-build-new -DCMAKE_BUILD_TYPE=Release
+cmake --build artifacts/drone-probe-build-new -j 4
+/home/shiuhou/venvs/mujoco/bin/python tools/drone_replay/input_probe.py \
+  --baseline artifacts/drone-green-nominal-01 \
+  --manifest /home/shiuhou/Projects/rm27_drones_px4/artifacts/green-rgb-replay-01/manifest.json \
+  --toolchain /home/shiuhou/Projects/rm27_drones_px4/artifacts/deps/pulsar2-6.0/ax_pulsar2_6.0_lite_package \
+  --library artifacts/drone-probe-build-new/libdrone_green_core.so \
+  --frames 8 26 30 39 --output artifacts/drone-input-probe-new
+```
+
+推理前保存 `registration.json`：固定幀、候選、門檻、素材與程式哈希。
+基線張量須通過模型／工具版本、I/O、原影像、準備後 RGB bytes 及輸出哈希
+檢查；變體實際執行 AXMODEL。輸出 `comparison.png`、`per_frame.json`、
+原始張量和摘要。`passed` 僅表示診斷完成，沒有連續追蹤或飛行資格含義。
+
+四張預先固定影像的最大分類信心如下，門檻維持 0.3：
+
+| 幀 | 原 RGB（重用推理） | NV21 轉回 RGB（新推理） |
+| --- | --- | --- |
+| 8 | 0.74155，通過中心關聯 | 0.25845，拒絕 |
+| 26 | 0.04062，拒絕 | 0.01454，拒絕 |
+| 30 | 0.10832，拒絕 | 0.00864，拒絕 |
+| 39 | 0.00864，拒絕 | 0.00179，拒絕 |
+
+沒有恢復三張低信心影像，且原本通過的一張也被拒絕，因此沒有將 NV21
+轉換設為預設。有限對照顯示輸入像素影響模型信心，尚不能區分場景背景、
+渲染細節、裁切尺度或訓練資料等原因。模型是否依賴裝甲背景仍未知。
+
+另固定官方 MaixCDK `30f4b8b7e3f66ded9cfa64fb081b46e30bc27248`，核對
+NHWC 分類 sigmoid、DFL、關鍵點 anchor／stride 和整數截斷公式一致。
+部署端 SDK 版本、NMS 和浮點逐像素等價仍未認證。
+原碼與檢查保存於 `artifacts/drone-input-audit-01/`。
+
+新推理 4 次、重用基線 4 次，10 項相關测试通過。
+`artifacts/drone-nv21-paired-probe-02/summary.json` 記錄完成結果；首輪因
+舊資料沒有獨立 `model_bundle.json` 而中止，保留於 `-01`。入口改讀已有的
+`inference_manifest.json` 模型哈希後完成，沒有略過模型核對。
+本輪沒有改門檻、重訓、增加飛行批次或宣稱末段失鎖已解決。

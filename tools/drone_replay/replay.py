@@ -52,6 +52,17 @@ class Core:
         if count < 0: raise RuntimeError(self.dll.dg_error().decode())
         return result[:count].copy()
 
+    def board_rgb(self, rgb):
+        """Diagnostic synthetic NV21 roundtrip using upstream conversion."""
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError('expected RGB image')
+        output = np.empty_like(rgb)
+        self.dll.dg_board_rgb.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        code = self.dll.dg_board_rgb(rgb.ctypes.data, rgb.shape[1], rgb.shape[0], output.ctypes.data)
+        if code: raise RuntimeError(self.dll.dg_error().decode())
+        return output
+
     def update(self, ts, candidates, confirmations):
         if isinstance(ts, bool) or not isinstance(ts, int) or not 0 <= ts < 2**64:
             raise ValueError('timestamp_us must be a nonnegative integer')

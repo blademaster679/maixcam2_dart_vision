@@ -78,6 +78,20 @@ def test_preprocessing_preserves_rgb_bytes_without_normalization():
     assert transform['gain'] == 5
 
 
+def test_board_conversion_preserves_rgb_order_and_rejects_odd_shape(core):
+    # Uniform saturated channels distinguish RGB from BGR; chroma sampling
+    # also changes a one-pixel edge, so this is deliberately not a no-op.
+    image = np.zeros((12, 16, 3), np.uint8)
+    image[:, :8] = [255, 0, 0]; image[:, 8:] = [0, 255, 0]
+    converted = core.board_rgb(image)
+    assert np.linalg.norm(converted[4, 4].astype(float) - [255, 0, 0]) < 3
+    assert np.linalg.norm(converted[4, 12].astype(float) - [0, 255, 0]) < 3
+    image[4, 5] = [0, 0, 255]
+    converted = core.board_rgb(image)
+    assert not np.array_equal(converted[4, 5], image[4, 5])
+    with pytest.raises(RuntimeError): core.board_rgb(image[:11])
+
+
 def test_maix_pose_equations_and_ignored_armor_keypoints():
     info = dict(inputs=[dict(shape=[1, 320, 320, 3])], outputs=[])
     outputs = {}

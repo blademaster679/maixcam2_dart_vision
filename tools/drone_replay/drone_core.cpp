@@ -34,6 +34,19 @@ struct Tracker {
 }
 extern "C" {
 const char* dg_error(){return error.c_str();}
+// Diagnostic only: synthesize NV21 from saved RGB, then run the original
+// board-side conversion. This cannot reconstruct real sensor NV21 bytes.
+int dg_board_rgb(const uint8_t*rgb,int width,int height,uint8_t*output){
+    try{
+        if(!rgb||!output||width<=0||height<=0||width%2||height%2)
+            throw std::invalid_argument("invalid RGB dimensions");
+        auto data=nv21_bytes(rgb,width,height);
+        dart::Nv21View view{data.data(),data.data()+width*height,width,height,width,width};
+        auto image=dart::nv21_rgb_region(view,{0,0,width,height},1);
+        std::memcpy(output,image->data(),static_cast<size_t>(width)*height*3);
+        return 0;
+    }catch(const std::exception&e){error=e.what();return -1;}
+}
 int dg_raw_proposals(const uint8_t*rgb,int width,int height,float*output){
     try{
         if(!rgb||!output||width<=0||height<=0||width%2||height%2)throw std::invalid_argument("invalid RGB dimensions");
