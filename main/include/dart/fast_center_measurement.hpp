@@ -14,9 +14,11 @@ struct FastCenterMeasurement {
     int pixels=0,peak_green=0;
 };
 inline FastCenterMeasurement measure_fast_green(const uint8_t *rgb,int w,int h,
-                                               float anchor_x,float anchor_y,float gate) {
+                                               float anchor_x,float anchor_y,float gate,
+                                               float maximum_aspect=4.0F) {
     if(!rgb||w<=0||h<=0||w>256||h>256||!std::isfinite(anchor_x)||
-       !std::isfinite(anchor_y)||!std::isfinite(gate)||gate<=0)
+       !std::isfinite(anchor_y)||!std::isfinite(gate)||gate<=0||
+       !std::isfinite(maximum_aspect)||maximum_aspect<1)
         throw std::invalid_argument("invalid bounded center measurement");
     // Estimate the bright local core before flood filling. Otherwise dim green
     // rails/walls connected to the lamp make the component reach the ROI edge.
@@ -53,7 +55,7 @@ inline FastCenterMeasurement measure_fast_green(const uint8_t *rgb,int w,int h,
         }
         const int bw=x1-x0+1,bh=y1-y0+1;
         if(x0==0||y0==0||x1==w-1||y1==h-1||peak<160||
-           (queue.size()<2&&peak<220)||std::max(bw,bh)>4*std::min(bw,bh)||
+           (queue.size()<2&&peak<220)||std::max(bw,bh)>maximum_aspect*std::min(bw,bh)||
            queue.size()*10<static_cast<size_t>(bw*bh))continue;
         const float x=xsum/weight,y=ysum/weight;
         const double d=std::hypot(x-anchor_x,y-anchor_y);
